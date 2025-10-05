@@ -18,6 +18,7 @@ import argparse
 import logging
 from io import BytesIO
 from pathlib import Path
+from tqdm.auto import tqdm
 
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
@@ -177,14 +178,17 @@ def stitch_tiles(z, tx_min, tx_max, ty_min, ty_max, config):
     big_w = cols * tile_size
     big_h = rows * tile_size
     big = Image.new("RGB", (big_w, big_h))
-    for ix, tx in enumerate(range(tx_min, tx_max + 1)):
-        for iy, ty in enumerate(range(ty_min, ty_max + 1)):
-            try:
-                t = fetch_tile(z, tx, ty, config)
-            except Exception as e:
-                logging.warning(f"Failed to fetch tile {z}/{ty}/{tx}: {e}")
-                t = Image.new("RGB", (tile_size, tile_size), (200, 200, 200))
-            big.paste(t, (ix * tile_size, iy * tile_size))
+    total = (tx_max - tx_min + 1) * (ty_max - ty_min + 1)
+    with tqdm(total=total, desc=f"Fetching tiles z={z}", unit="tile") as p:
+        for ix, tx in enumerate(range(tx_min, tx_max + 1)):
+            for iy, ty in enumerate(range(ty_min, ty_max + 1)):
+                try:
+                    t = fetch_tile(z, tx, ty, config)
+                except Exception as e:
+                    logging.warning(f"Failed to fetch tile {z}/{ty}/{tx}: {e}")
+                    t = Image.new("RGB", (tile_size, tile_size), (200, 200, 200))
+                big.paste(t, (ix * tile_size, iy * tile_size))
+                p.update(1)
     return big, (tx_min, ty_min)
 
 def build_elevation_map(lat_min, lat_max, lon_min, lon_max, zoom=12, cache_dir="./elevation_tiles"):
@@ -202,27 +206,31 @@ def build_elevation_map(lat_min, lat_max, lon_min, lon_max, zoom=12, cache_dir="
     lon_range = range(int(math.floor(lon_min)), int(math.ceil(lon_max)))
 
     src_files_to_mosaic = []
-    for lat in lat_range:
-        for lon in lon_range:
-            ns = "N" if lat >= 0 else "S"
-            ew = "E" if lon >= 0 else "W"
-            filename = f"{ns}{abs(lat):02d}{ew}{abs(lon):03d}.hgt.gz"
-            url = f"https://s3.amazonaws.com/elevation-tiles-prod/skadi/{ns}{abs(lat):02d}/{filename}"
-            local_path = os.path.join(cache_dir, filename)
+    total = len(lat_range) * len(lon_range)
+    with tqdm(total=total, desc="Fetching elevation tiles", unit="tile") as p:
+        for lat in lat_range:
+            for lon in lon_range:
+                ns = "N" if lat >= 0 else "S"
+                ew = "E" if lon >= 0 else "W"
+                filename = f"{ns}{abs(lat):02d}{ew}{abs(lon):03d}.hgt.gz"
+                url = f"https://s3.amazonaws.com/elevation-tiles-prod/skadi/{ns}{abs(lat):02d}/{filename}"
+                local_path = os.path.join(cache_dir, filename)
 
-            # Download tile if missing
-            if not os.path.exists(local_path):
-                r = requests.get(url)
-                if r.status_code == 200:
-                    with open(local_path, "wb") as f:
-                        f.write(r.content)
-                else:
-                    print(f"⚠️ Missing elevation tile {filename}")
-                    continue
+                # Download tile if missing
+                if not os.path.exists(local_path):
+                    r = requests.get(url, timeout=20)
+                    if r.status_code == 200:
+                        with open(local_path, "wb") as f:
+                            f.write(r.content)
+                    else:
+                        print(f"⚠️ Missing elevation tile {filename}")
+                        p.update(1)
+                        continue
 
-            # Open with rasterio directly (gzip-compressed)
-            src = rasterio.open(f"gzip://{local_path}")
-            src_files_to_mosaic.append(src)
+                # Open with rasterio directly (gzip-compressed)
+                src = rasterio.open(f"gzip://{local_path}")
+                src_files_to_mosaic.append(src)
+                p.update(1)
 
     # Merge multiple tiles into one elevation array
     mosaic, out_trans = merge(src_files_to_mosaic)
