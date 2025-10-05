@@ -132,6 +132,16 @@ def global_pixel_to_tile(pixel_x, pixel_y, tile_size=256):
     ty = int(math.floor(pixel_y / tile_size))
     return tx, ty
 
+def global_pixel_to_lonlat(pixel_x, pixel_y, z, tile_size=256):
+    x, y = global_pixel_to_mercator(pixel_x, pixel_y, z, tile_size)
+    lon, lat = mercator_to_lonlat(x, y)
+    return lon, lat
+
+def lonlat_to_global_pixel(lon, lat, z, tile_size=256):
+    x, y = lonlat_to_mercator(lon, lat)
+    px, py = mercator_to_global_pixel(x, y, z, tile_size)
+    return px, py
+
 def fetch_tile(z, x, y, config):
     cache_dir = Path(config["tile_cache_dir"])
     ensure_dir(cache_dir)
@@ -246,8 +256,7 @@ def rasterize_elevation_map(elevation_map, transform, min_x_px, max_x_px, min_y_
         np.arange(min_x_px, max_x_px + 1),
         indexing='ij'
     )
-    
-    lons, lats = mercator_to_lonlat(*global_pixel_to_mercator(x_coords.flatten(), y_coords.flatten(), z, tile_size))
+    lons, lats = global_pixel_to_lonlat(x_coords.flatten(), y_coords.flatten(), z, tile_size)
     rows, cols = rasterio.transform.rowcol(transform, lons, lats)
     valid_mask = (
         (rows >= 0) & (rows < elevation_map.shape[0]) &
@@ -447,8 +456,8 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
     crop_max_y_px = crop_min_y_px + canvas_height_px
     
     # Elevation Processing
-    crop_min_lon, crop_min_lat = mercator_to_lonlat(*global_pixel_to_mercator(crop_min_x_px, crop_max_y_px, map_z, tile_size))
-    crop_max_lon, crop_max_lat = mercator_to_lonlat(*global_pixel_to_mercator(crop_max_x_px, crop_min_y_px, map_z, tile_size))
+    crop_min_lon, crop_min_lat = global_pixel_to_lonlat(crop_min_x_px, crop_max_y_px, map_z, tile_size)
+    crop_max_lon, crop_max_lat = global_pixel_to_lonlat(crop_max_x_px, crop_min_y_px, map_z, tile_size)
     elev_map, elev_transform = build_elevation_map(crop_min_lat, crop_max_lat, crop_min_lon, crop_max_lon)
     elevs = sample_elevation_from_map(elev_map, elev_transform, lats, lons)
     # Smooth the elevation profile using a simple moving average
@@ -483,10 +492,10 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
 
     big_img, (origin_tx, origin_ty) = stitch_tiles(map_z, tx_min, tx_max, ty_min, ty_max, cfg)
 
-    origin_global_px_x = origin_tx * tile_size
-    origin_global_px_y = origin_ty * tile_size
-    crop_left_in_big = crop_min_x_px - origin_global_px_x
-    crop_top_in_big = crop_min_y_px - origin_global_px_y
+    global_origin_x_px = origin_tx * tile_size
+    global_origin_y_px = origin_ty * tile_size
+    crop_left_in_big = crop_min_x_px - global_origin_x_px
+    crop_top_in_big = crop_min_y_px - global_origin_y_px
     crop_box = (int(crop_left_in_big), int(crop_top_in_big), int(crop_left_in_big + canvas_width_px), int(crop_top_in_big + canvas_height_px))
     # clamp crop box into big_img range
     big_w, big_h = big_img.size
@@ -501,11 +510,11 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
     # If crop was clipped (rare), paste into full sized white canvas
     if content_img.size != (canvas_width_px, canvas_height_px):
         full = Image.new("RGB", (canvas_width_px, canvas_height_px), (255, 255, 255))
-        full.paste(content_img, (max(0, - (crop_min_x_px - origin_global_px_x)), max(0, - (crop_min_y_px - origin_global_px_y))))
+        full.paste(content_img, (max(0, - (crop_min_x_px - global_origin_x_px)), max(0, - (crop_min_y_px - global_origin_y_px))))
         content_img = full
 
-    out_png = Path(out_pdf).with_suffix(".background.png")
     if cfg["save_background_png"]:
+        out_png = Path(out_pdf).with_suffix(".background.png")
         content_img.save(out_png, dpi=(cfg["dpi"], cfg["dpi"]))
         logging.info(f"Saved assembled background to {out_png}")
 
