@@ -269,7 +269,6 @@ def rasterize_elevation_map(elevation_map, transform, min_x_px, max_x_px, min_y_
     elevation_array[output_y_indices, output_x_indices] = valid_elevations
     
     return elevation_array
-    
 
 def apply_colormap_to_values(vals, vmin, vmax, cmap_name="JET"):
     if cmap_name not in _CV2_COLORMAPS:
@@ -302,6 +301,9 @@ def create_pdf_with_track(
     bbox_maxx,
     bbox_maxy,
     padding_cm,
+    zoom_center_x_m=None,
+    zoom_center_y_m=None,
+    zoom_factor=None,
 ):
     w_cm = config["width_cm"]
     h_cm = config["height_cm"]
@@ -335,6 +337,9 @@ def create_pdf_with_track(
         ys = np.asarray(ys, dtype=float)
         x_pts = (xs - center_x) / meters_per_pt + page_w_pt / 2.0
         y_pts = (ys - center_y) / meters_per_pt + page_h_pt / 2.0
+        if zoom_center_x_m is not None and zoom_center_y_m is not None and zoom_factor is not None:
+            x_pts = zoom_factor * (xs - zoom_center_x_m) / meters_per_pt + page_w_pt / 2.0
+            y_pts = zoom_factor * (ys - zoom_center_y_m) / meters_per_pt + page_h_pt / 2.0
         return x_pts, y_pts
 
     elev_min = config["elev_min"]
@@ -356,7 +361,7 @@ def create_pdf_with_track(
     halo_width_pt = float(config["white_halo_pt"])
     color_width_pt = float(config["colored_track_pt"])
 
-    # 1) Draw the white halo as *one grouped path* (single stroke)
+    # 1) Draw the white halo as
     path = c.beginPath()
     path.moveTo(float(x_pts[0]), float(y_pts[0]))
     for xi, yi in zip(x_pts[1:], y_pts[1:]):
@@ -441,19 +446,30 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
     map_mpp = meters_per_pixel_for_zoom(map_z, tile_size=tile_size)
     logging.info(f"Using zoom level z={map_z}; resolution {map_mpp:.6f} m/px; target {target_mpp:.6f} m/px")
 
-    # convert bbox corners to global pixel space
-    track_min_x_px, track_min_y_px = mercator_to_global_pixel(track_min_x_m, track_min_y_m, map_z, tile_size)
-    track_max_x_px, track_max_y_px = mercator_to_global_pixel(track_max_x_m, track_max_y_m, map_z, tile_size)
+    # convert bbox corners to global pixel space. Remember that y axis is flipped wrt mercator
+    track_min_x_px, track_max_y_px = mercator_to_global_pixel(track_min_x_m, track_min_y_m, map_z, tile_size)
+    track_max_x_px, track_min_y_px = mercator_to_global_pixel(track_max_x_m, track_max_y_m, map_z, tile_size)
+    track_width_px = track_max_x_px - track_min_x_px
+    track_height_px = track_max_y_px - track_min_y_px
+    print(f"Target padding in px: {pad_px}, actual padding: {(canvas_width_px - track_width_px) // 2}, {(canvas_height_px - track_height_px) // 2}")
+    zoom_factor_x = avail_width_px / float(track_width_px)
+    zoom_factor_y = avail_height_px / float(track_height_px)
+    zoom_factor = min(zoom_factor_x, zoom_factor_y)
+    zoom_center_x_m = 0.5 * (track_min_x_m + track_max_x_m)
+    zoom_center_y_m = 0.5 * (track_min_y_m + track_max_y_m)
+    if zoom_factor > 1.0:
+        logging.warning(f"Warning: Interpolation lost {100 * ():.2f}% image detail.")
+    print(zoom_factor, zoom_factor_x, zoom_factor_y)
     
     # center pixel for the track
     center_px_x = 0.5 * (track_min_x_px + track_max_x_px)
     center_px_y = 0.5 * (track_min_y_px + track_max_y_px)
 
     # crop a full-page region (w_px x h_px) centered at center_px
-    crop_min_x_px = int(math.floor(center_px_x - canvas_width_px / 2.0))
-    crop_min_y_px = int(math.floor(center_px_y - canvas_height_px / 2.0))
-    crop_max_x_px = crop_min_x_px + canvas_width_px
-    crop_max_y_px = crop_min_y_px + canvas_height_px
+    crop_min_x_px = int(math.floor(center_px_x - canvas_width_px / zoom_factor / 2.0))
+    crop_min_y_px = int(math.floor(center_px_y - canvas_height_px / zoom_factor / 2.0))
+    crop_max_x_px = crop_min_x_px + canvas_width_px / zoom_factor
+    crop_max_y_px = crop_min_y_px + canvas_height_px / zoom_factor
     
     # Elevation Processing
     crop_min_lon, crop_min_lat = global_pixel_to_lonlat(crop_min_x_px, crop_max_y_px, map_z, tile_size)
@@ -491,9 +507,20 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
     logging.info(f"Fetching tiles z={map_z}, x={tx_min}..{tx_max}, y={ty_min}..{ty_max}")
 
     big_img, (origin_tx, origin_ty) = stitch_tiles(map_z, tx_min, tx_max, ty_min, ty_max, cfg)
-
     global_origin_x_px = origin_tx * tile_size
     global_origin_y_px = origin_ty * tile_size
+    # scale the big_img by zoom_factor
+    if zoom_factor != 1.0:
+        new_w = int(round(big_img.width * zoom_factor))
+        new_h = int(round(big_img.height * zoom_factor))
+        big_img = big_img.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
+        global_origin_x_px = int(round(center_px_x - (center_px_x - global_origin_x_px) * zoom_factor))
+        global_origin_y_px = int(round(center_px_y - (center_px_y - global_origin_y_px) * zoom_factor))
+        crop_min_x_px = int(round(center_px_x - (center_px_x - crop_min_x_px) * zoom_factor))
+        crop_min_y_px = int(round(center_px_y - (center_px_y - crop_min_y_px) * zoom_factor))
+        crop_max_x_px = crop_min_x_px + canvas_width_px / zoom_factor
+        crop_max_y_px = crop_min_y_px + canvas_height_px / zoom_factor
+
     crop_left_in_big = crop_min_x_px - global_origin_x_px
     crop_top_in_big = crop_min_y_px - global_origin_y_px
     crop_box = (int(crop_left_in_big), int(crop_top_in_big), int(crop_left_in_big + canvas_width_px), int(crop_top_in_big + canvas_height_px))
@@ -540,6 +567,8 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
         cfg,
         bbox_minx, bbox_miny, bbox_maxx, bbox_maxy,
         cfg["padding_cm"],
+        zoom_center_x_m, zoom_center_y_m,
+        zoom_factor
     )
 
     print("Done. PDF written to:", out_pdf)
