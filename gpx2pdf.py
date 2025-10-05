@@ -385,6 +385,11 @@ def create_pdf_with_track(
         # fallback: single point
         pass
     else:
+        # Draw all colored runs into a single Form XObject so Illustrator imports it as one element
+        form_name = "colored_path"
+        c.beginForm(form_name, 0, 0, page_w_pt, page_h_pt)
+        c.setLineJoin(1)
+        c.setLineCap(1)
         i = 0
         while i < nseg:
             j = i + 1
@@ -401,6 +406,8 @@ def create_pdf_with_track(
             c.setLineWidth(color_width_pt)
             c.drawPath(p, stroke=1, fill=0)
             i = j
+        c.endForm()
+        c.doForm(form_name)
 
     # start/end markers (optional)
     start_r_pt = max(0.5, color_width_pt * 1.5)
