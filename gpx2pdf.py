@@ -12,12 +12,15 @@ Usage:
     python gpx2pdf.py track.gpx out.pdf
     See --help for CLI args.
 """
+import io
 import os
 import math
 import argparse
 import logging
 from io import BytesIO
 from pathlib import Path
+import zipfile
+import pandas as pd
 from tqdm.auto import tqdm
 
 import matplotlib
@@ -35,28 +38,18 @@ from reportlab.lib.units import cm
 import rasterio
 from rasterio.merge import merge
 from rasterio.warp import calculate_default_transform, reproject, Resampling
+import geopandas as gpd
+from shapely.geometry import Point
+from svglib.svglib import svg2rlg
+from reportlab.graphics import renderPDF
+from reportlab.lib import colors
+from reportlab.graphics.shapes import Group, Shape
+import xml.etree.ElementTree as ET
+from io import StringIO
+import re
 
 
-# ---------------- CONFIG ----------------
-CONFIG = {
-    "width_cm": 10.0,
-    "height_cm": 10.0,
-    "padding_cm": 1.0,
-    "dpi": 800,
-    "colormap": "JET",
-    "elev_min": None,
-    "elev_max": None,
-    "colored_track_pt": 1.0,
-    "white_halo_pt": 2.0,
-    "tile_url_template": "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg",
-    "tile_cache_dir": "./tiles",
-    "tile_size": 256,
-    "max_zoom": 20,
-    "min_zoom": 0,
-    "http_headers": {"User-Agent": "gpx2pdf/1.0 (+https://example.org/)"},
-    "save_background_png": True,
-    "smoothing_window": 50,  # window size for elevation profile smoothing in samples
-}
+# Configuration defaults are now handled by argparse
 _CV2_COLORMAPS = {
     "AUTUMN": cv2.COLORMAP_AUTUMN,
     "BONE": cv2.COLORMAP_BONE,
@@ -80,15 +73,17 @@ def read_gpx(gpx_path):
     with open(gpx_path, "r", encoding="utf-8") as f:
         gpx = gpxpy.parse(f)
     pts = []
+    times = []
     for track in gpx.tracks:
         for seg in track.segments:
             for p in seg.points:
                 if p.latitude is None or p.longitude is None:
                     continue
                 pts.append((p.longitude, p.latitude, p.elevation if p.elevation is not None else 0.0))
+                times.append(p.time)
     if not pts:
         raise ValueError("No trackpoints found in GPX.")
-    return np.array(pts, dtype=float)
+    return np.array(pts, dtype=float), times
 
 _transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 def lonlat_to_mercator(lon, lat):
@@ -99,6 +94,64 @@ _transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=
 def mercator_to_lonlat(x, y):
     lon, lat = _transformer_to_4326.transform(x, y)
     return lon, lat
+
+def calculate_speeds_from_track(pts, times, unit="km/h"):
+    """
+    Calculate speeds between consecutive trackpoints.
+    
+    Args:
+        pts: numpy array of shape (n, 3) with [lon, lat, elev]
+        times: list of datetime objects for each point
+        unit: output unit - "m/s", "km/h", "kt", or "min/km"
+    
+    Returns:
+        numpy array of speeds in specified unit for each segment (length n-1)
+    """
+    if len(pts) < 2 or len(times) != len(pts):
+        return np.array([])
+    
+    speeds = []
+    for i in range(len(pts) - 1):
+        if times[i] is None or times[i+1] is None:
+            speeds.append(0.0)
+            continue
+            
+        # Calculate distance between consecutive points
+        lon1, lat1 = pts[i, 0], pts[i, 1]
+        lon2, lat2 = pts[i+1, 0], pts[i+1, 1]
+        
+        # Convert to mercator and calculate distance
+        x1, y1 = lonlat_to_mercator(lon1, lat1)
+        x2, y2 = lonlat_to_mercator(lon2, lat2)
+        distance_m = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+        
+        # Calculate time difference
+        time_diff_s = (times[i+1] - times[i]).total_seconds()
+        
+        if time_diff_s > 0:
+            speed_ms = distance_m / time_diff_s
+        else:
+            speed_ms = 0.0
+        
+        # Convert to requested unit
+        if unit == "m/s":
+            final_speed = speed_ms
+        elif unit == "km/h":
+            final_speed = speed_ms * 3.6
+        elif unit == "kt":
+            final_speed = speed_ms * 1.943844  # m/s to knots
+        elif unit == "min/km":
+            # For pace: minutes per kilometer
+            if speed_ms > 0:
+                final_speed = 1000.0 / speed_ms / 60.0  # minutes per km
+            else:
+                final_speed = 0.0
+        else:
+            raise ValueError(f"Unknown unit: {unit}")
+            
+        speeds.append(final_speed)
+    
+    return np.array(speeds, dtype=float)
 
 EARTH_RADIUS = 6378137.0
 HALF_WORLD = math.pi * EARTH_RADIUS
@@ -143,8 +196,8 @@ def lonlat_to_global_pixel(lon, lat, z, tile_size=256):
     px, py = mercator_to_global_pixel(x, y, z, tile_size)
     return px, py
 
-def fetch_tile(z, x, y, config):
-    cache_dir = Path(config["tile_cache_dir"])
+def fetch_tile(z, x, y, args):
+    cache_dir = Path(args.tile_cache)
     ensure_dir(cache_dir)
     layer_name = "eox_s2cloudless"
     ext = "jpg"
@@ -159,9 +212,8 @@ def fetch_tile(z, x, y, config):
             cache_name.unlink(missing_ok=True)
             
     # print(f"Fetching tile {z}/{x}/{y}")
-    url = config["tile_url_template"].format(z=z, x=x, y=y)
-    headers = config.get("http_headers", {})
-    resp = requests.get(url, headers=headers, timeout=20)
+    url = args.tile_url.format(z=z, x=x, y=y)
+    resp = requests.get(url, headers={}, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"Failed to fetch tile {z}/{y}/{x} -> HTTP {resp.status_code}: {url}")
     img = Image.open(BytesIO(resp.content)).convert("RGB")
@@ -171,8 +223,8 @@ def fetch_tile(z, x, y, config):
         pass
     return img
 
-def stitch_tiles(z, tx_min, tx_max, ty_min, ty_max, config):
-    tile_size = config["tile_size"]
+def stitch_tiles(z, tx_min, tx_max, ty_min, ty_max, args):
+    tile_size = args.tile_size
     cols = tx_max - tx_min + 1
     rows = ty_max - ty_min + 1
     big_w = cols * tile_size
@@ -183,7 +235,7 @@ def stitch_tiles(z, tx_min, tx_max, ty_min, ty_max, config):
         for ix, tx in enumerate(range(tx_min, tx_max + 1)):
             for iy, ty in enumerate(range(ty_min, ty_max + 1)):
                 try:
-                    t = fetch_tile(z, tx, ty, config)
+                    t = fetch_tile(z, tx, ty, args)
                 except Exception as e:
                     logging.warning(f"Failed to fetch tile {z}/{ty}/{tx}: {e}")
                     t = Image.new("RGB", (tile_size, tile_size), (200, 200, 200))
@@ -297,33 +349,156 @@ def apply_colormap_to_values(vals, vmin, vmax, cmap_name="JET"):
     colors = np.array([rgb_map[int(v)] for v in u8], dtype=np.uint8)
     return colors.reshape((-1, 3)), u8.reshape((-1,))
 
-def create_pdf_with_track(
+def load_settlements(min_lon, max_lon, min_lat, max_lat, min_population=10_000):
+    """
+    Loads populated places from Natural Earth, filters them by population.
+
+    Args:
+        min_population (int): Minimum population for inclusion.
+    Returns:
+        GeoDataFrame: Filtered settlements with geometry in WGS84 (lat/lon).
+    """
+    cache_dir = Path("./allCountries_cache")
+    ensure_dir(cache_dir)
+    URL = "https://download.geonames.org/export/dump/allCountries.zip"
+    zip_path = cache_dir / "allCountries.zip"
+    txt_path = cache_dir / "allCountries.txt"
+
+    # Download and extract allCountries.txt if needed
+    if not txt_path.exists():
+        if not zip_path.exists():
+            print(f"Downloading {URL} ...")
+            r = requests.get(URL, stream=True)
+            with open(zip_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        print(f"Extracting allCountries.txt ...")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extract("allCountries.txt", path=cache_dir)
+
+    # Read the relevant columns directly
+    cols = ["geonameid","name","asciiname","alternatenames","latitude","longitude",
+            "feature_class","feature_code","country_code","cc2","admin1","admin2",
+            "admin3","admin4","population","elevation","dem","timezone","moddate"]
+    df = pd.read_csv(txt_path, sep="\t", header=None, names=cols,
+                     usecols=["name","latitude","longitude","population"], dtype={"population": int})
+
+    # filter population > 100
+    df = df[df["population"] > min_population][["name","latitude","longitude","population"]]
+        
+    result = {
+        line["name"]: {
+            "lon": line["longitude"], 
+            "lat": line["latitude"], 
+            "population": line["population"]
+        } for _, line in df.iterrows() if line["name"] and line["longitude"] >= min_lon and line["longitude"] <= max_lon and line["latitude"] >= min_lat and line["latitude"] <= max_lat
+    }
+    return result
+
+def load_and_scale_svg_marker(svg_filename, desired_size, args):
+    """
+    Load an SVG marker file, apply annotation color, and scale it to the desired size.
+    
+    Args:
+        svg_filename (str): Name of the SVG file in the markers directory
+        desired_size (float): Desired size in points for the marker
+        args: Arguments object containing annotation_color
+    
+    Returns:
+        tuple: (drawing, scaled_width, scaled_height) or (None, 0, 0) if failed
+    """
+    try:
+        svg_path = Path(__file__).parent / "markers" / svg_filename
+        if not svg_path.exists():
+            return None, 0, 0
+            
+        svg_string = svg_path.read_text(encoding="utf-8")
+        
+        def svg_all_white(svg_text):
+            """Convert SVG colors to annotation_color"""
+            # Convert annotation color to CSS format
+            r, g, b = args.annotation_color
+            color_str = f"rgb({int(r*255)},{int(g*255)},{int(b*255)})"
+            
+            # Register the default SVG namespace
+            if 'xmlns=' in svg_text:
+                ns_match = re.search(r'xmlns="([^"]+)"', svg_text)
+                if ns_match:
+                    ns = ns_match.group(1)
+                    ET.register_namespace('', ns)
+
+            root = ET.fromstring(svg_text)
+            
+            # Find and modify <style> tags
+            for style_tag in root.findall('.//{http://www.w3.org/2000/svg}style'):
+                if style_tag.text:
+                    def replace_color(match):
+                        prop = match.group(1)
+                        color = match.group(2).strip()
+                        if color.lower() in ('none', 'transparent'):
+                            return match.group(0)
+                        return f'{prop}: {color_str}'
+
+                    css_text = re.sub(r'(fill|stroke)\s*:\s*([^;}]+)', replace_color, style_tag.text)
+                    style_tag.text = css_text
+
+            # Modify inline fill/stroke attributes
+            for elem in root.iter():
+                for attr in ("fill", "stroke"):
+                    val = elem.attrib.get(attr)
+                    if val and val.lower() not in ("none", "transparent"):
+                        elem.set(attr, color_str)
+            
+            out = StringIO()
+            ET.ElementTree(root).write(out, encoding='unicode')
+            return out.getvalue()
+        
+        drawing = svg2rlg(StringIO(svg_all_white(svg_string)))
+        
+        # Get drawing dimensions
+        dw = getattr(drawing, "width", None)
+        dh = getattr(drawing, "height", None)
+        if not dw or not dh:
+            try:
+                bbox = drawing.getBounds()
+                dw = bbox[2] - bbox[0]
+                dh = bbox[3] - bbox[1]
+            except Exception:
+                dw = dh = 1.0
+        
+        dw = float(dw)
+        dh = float(dh)
+        
+        # Scale to desired size
+        scale = desired_size / max(dw, dh)
+        drawing.scale(scale, scale)
+        
+        return drawing, dw * scale, dh * scale
+        
+    except Exception:
+        return None, 0, 0
+
+def create_pdf_with_track_and_settlements(
     out_pdf_path,
     bg_image_pil,
     merc_xs,
     merc_ys,
-    elevs,
-    config,
+    colorize_values,
+    args,
     bbox_minx,
     bbox_miny,
     bbox_maxx,
     bbox_maxy,
     padding_cm,
-    zoom_center_x_m=None,
-    zoom_center_y_m=None,
-    zoom_factor=None,
+    zoom_config=None,
+    settlements=None
 ):
-    w_cm = config["width_cm"]
-    h_cm = config["height_cm"]
-    dpi = config["dpi"]
+    w_cm = args.width_cm
+    h_cm = args.height_cm
+    dpi = args.dpi
     page_w_pt = w_cm * cm
     page_h_pt = h_cm * cm
     pad_pt = padding_cm * cm
-    avail_w_pt = page_w_pt - 2 * pad_pt
-    avail_h_pt = page_h_pt - 2 * pad_pt
-
-    page_w_px = int(round((w_cm * CM_TO_INCH) * dpi))
-    page_h_px = int(round((h_cm * CM_TO_INCH) * dpi))
 
     tmp_png = Path(out_pdf_path).with_suffix(".bg.png")
     bg_image_pil.save(tmp_png, dpi=(dpi, dpi))
@@ -345,36 +520,36 @@ def create_pdf_with_track(
         ys = np.asarray(ys, dtype=float)
         x_pts = (xs - center_x) / meters_per_pt + page_w_pt / 2.0
         y_pts = (ys - center_y) / meters_per_pt + page_h_pt / 2.0
-        if zoom_center_x_m is not None and zoom_center_y_m is not None and zoom_factor is not None:
-            x_pts = zoom_factor * (xs - zoom_center_x_m) / meters_per_pt + page_w_pt / 2.0
-            y_pts = zoom_factor * (ys - zoom_center_y_m) / meters_per_pt + page_h_pt / 2.0
+        if zoom_config is not None:
+            x_pts = zoom_config["factor"] * (xs - zoom_config["center_x_m"]) / meters_per_pt + page_w_pt / 2.0
+            y_pts = zoom_config["factor"] * (ys - zoom_config["center_y_m"]) / meters_per_pt + page_h_pt / 2.0
         return x_pts, y_pts
 
-    elev_min = config["elev_min"]
-    elev_max = config["elev_max"]
+    elev_min = args.colorize_min_val
+    elev_max = args.colorize_max_val
     if elev_min is None:
-        elev_min = float(np.nanmin(elevs))
+        elev_min = float(np.nanmin(colorize_values))
     if elev_max is None:
-        elev_max = float(np.nanmax(elevs))
+        elev_max = float(np.nanmax(colorize_values))
 
-    # segment color mapping: use segment-averaged elevation
-    seg_vals = 0.5 * (elevs[:-1] + elevs[1:])
-    seg_colors_rgb, seg_u8 = apply_colormap_to_values(seg_vals, elev_min, elev_max, cmap_name=config["colormap"])
+    # segment color mapping: use segment-averaged values
+    seg_vals = 0.5 * (colorize_values[:-1] + colorize_values[1:])
+    seg_colors_rgb, seg_u8 = apply_colormap_to_values(seg_vals, elev_min, elev_max, cmap_name=args.cmap)
 
     x_pts, y_pts = merc_to_point(merc_xs, merc_ys)
 
     c.setLineJoin(1)
     c.setLineCap(1)
 
-    halo_width_pt = float(config["white_halo_pt"])
-    color_width_pt = float(config["colored_track_pt"])
+    halo_width_pt = float(args.white_halo_pt)
+    color_width_pt = float(args.colored_track_pt)
 
     # 1) Draw the white halo as
     path = c.beginPath()
     path.moveTo(float(x_pts[0]), float(y_pts[0]))
     for xi, yi in zip(x_pts[1:], y_pts[1:]):
         path.lineTo(float(xi), float(yi))
-    c.setStrokeColorRGB(1.0, 1.0, 1.0)
+    c.setStrokeColorRGB(*args.annotation_color)
     c.setLineWidth(halo_width_pt)
     c.drawPath(path, stroke=1, fill=0)
 
@@ -409,13 +584,129 @@ def create_pdf_with_track(
         c.endForm()
         c.doForm(form_name)
 
-    # start/end markers (optional)
-    start_r_pt = max(0.5, color_width_pt * 1.5)
-    end_r_pt = start_r_pt
-    c.setFillColorRGB(0.0, 0.7, 0.0)
-    c.circle(float(x_pts[0]), float(y_pts[0]), start_r_pt, stroke=0, fill=1)
-    c.setFillColorRGB(0.9, 0.0, 0.0)
-    c.circle(float(x_pts[-1]), float(y_pts[-1]), end_r_pt, stroke=0, fill=1)
+    # start/end markers with SVG
+    marker_size = max(args.start_goal_marker_width_pt, color_width_pt * 2.0)
+
+    # Start marker
+    drawing, scaled_w, scaled_h = load_and_scale_svg_marker("start.svg", marker_size, args)
+    if drawing is not None:
+        tx = float(x_pts[0])
+        ty = float(y_pts[0])
+        renderPDF.draw(drawing, c, tx, ty)
+    
+    # End marker
+    drawing, scaled_w, scaled_h = load_and_scale_svg_marker("goal.svg", marker_size, args)
+    if drawing is not None:
+        tx = float(x_pts[-1])
+        ty = float(y_pts[-1])
+        renderPDF.draw(drawing, c, tx, ty)
+    
+    for s_name, s_info in settlements.items():
+        x_m, y_m = lonlat_to_mercator(s_info["lon"], s_info["lat"])
+        x_px, y_px = merc_to_point(x_m, y_m)
+        
+        # Determine if this is a large or small settlement
+        is_large_settlement = s_info["population"] >= args.large_settlement_population
+        svg_filename = "big_settlement.svg" if is_large_settlement else "small_settlement.svg"
+        desired_size = float(args.city_marker_width_pt)
+        
+        # Draw custom SVG marker using the reusable function
+        drawing, scaled_w, scaled_h = load_and_scale_svg_marker(svg_filename, desired_size, args)
+        if drawing is not None:
+            tx = float(x_px) - scaled_w / 2.0
+            ty = float(y_px) - scaled_h / 2.0
+            renderPDF.draw(drawing, c, tx, ty)
+        else:
+            # fallback circle if SVG missing or failed to load
+            c.setFillColorRGB(*args.annotation_color)
+            c.circle(float(x_px), float(y_px), 4, stroke=0, fill=1)
+        
+        # Draw city name at top right of marker
+        c.setFont("Helvetica", 10)
+        text_x = float(x_px) + 6
+        text_y = float(y_px) + 6
+        c.setFillColorRGB(*args.annotation_color)
+        c.drawString(text_x, text_y, s_name)
+
+    # Draw legend in bottom left
+    legend_square_size = 3.0 * (72.0 / 25.4)  # 5mm in points
+    legend_padding = 1.0 * (72.0 / 25.4)      # 1mm in points
+    legend_start_x = 10.0 * (72.0 / 25.4)     # 10mm from left edge
+    legend_start_y = 10.0 * (72.0 / 25.4)     # 10mm from bottom edge
+    
+    # Calculate legend dimensions
+    legend_squares = 5
+    legend_height = legend_squares * legend_square_size + (legend_squares - 1) * legend_padding
+    
+    # Prepare text samples for width calculation
+    c.setFont("Helvetica", 8)
+    
+    unit_str = args.unit
+    sample_texts = []
+    for i in range(legend_squares):
+        val = elev_min + (elev_max - elev_min) * i / (legend_squares - 1)
+        
+        if args.colorize_by == "elevation":
+            text = f"{val:.0f} {unit_str}"
+        elif args.unit == "min/km":
+            # For pace, format as MM:SS per km
+            minutes = int(val)
+            seconds = int((val - minutes) * 60)
+            text = f"{minutes:02d}:{seconds:02d} {unit_str}"
+        else:
+            text = f"{val:.1f} {unit_str}"
+        sample_texts.append(text)
+    
+    # Calculate maximum text width
+    max_text_width = max(c.stringWidth(text, "Helvetica", 8) for text in sample_texts)
+    legend_width = legend_square_size + legend_padding + max_text_width
+    
+    # Draw background rectangle with 50% gray at 50% opacity
+    bg_margin = 1.0 * (72.0 / 25.4)  # 1mm margin around elements
+    bg_x = legend_start_x - bg_margin
+    bg_y = legend_start_y - bg_margin
+    bg_width = legend_width + 2 * bg_margin
+    bg_height = legend_height + 2 * bg_margin
+    
+    c.saveState()
+    c.setFillColorRGB(0.5, 0.5, 0.5)  # 50% gray
+    c.setFillAlpha(0.5)               # 50% opacity
+    c.rect(bg_x, bg_y, bg_width, bg_height, stroke=0, fill=1)
+    c.restoreState()
+    
+    # Draw legend squares and text
+    for i in range(legend_squares):
+        # Calculate value for this square (from min to max)
+        val = elev_min + (elev_max - elev_min) * i / (legend_squares - 1)
+        
+        # Get color for this value
+        colors_rgb, _ = apply_colormap_to_values([val], elev_min, elev_max, cmap_name=args.cmap)
+        r, g, b = colors_rgb[0] / 255.0
+        
+        # Square position (from bottom to top)
+        square_y = legend_start_y + i * (legend_square_size + legend_padding)
+        
+        # Draw colored square
+        c.setFillColorRGB(float(r), float(g), float(b))
+        c.rect(legend_start_x, square_y, legend_square_size, legend_square_size, stroke=0, fill=1)
+        
+        # Draw value text
+        text_x = legend_start_x + legend_square_size + legend_padding
+        text_y = square_y + legend_square_size / 2.0 - 3.0  # Center vertically
+        
+        if args.colorize_by == "elevation":
+            text = f"{val:.0f} {unit_str}"
+        elif args.unit == "min/km":
+            # For pace, format as MM:SS per km
+            minutes = int(val)
+            seconds = int((val - minutes) * 60)
+            text = f"{minutes:02d}:{seconds:02d} {unit_str}"
+        else:
+            text = f"{val:.1f} {unit_str}"
+            
+        c.setFillColorRGB(*args.annotation_color)
+        c.setFont("Helvetica", 8)
+        c.drawString(text_x, text_y, text)
 
     c.showPage()
     c.save()
@@ -427,12 +718,10 @@ def create_pdf_with_track(
 
 CM_TO_INCH = 1.0 / 2.54
 # -------- main workflow ----------
-def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
-    cfg = CONFIG.copy()
-    cfg.update(user_config or {})
-    ensure_dir(cfg["tile_cache_dir"])
+def process_gpx_to_pdf(gpx_file, out_pdf, args):
+    ensure_dir(args.tile_cache)
 
-    pts = read_gpx(gpx_file)
+    pts, times = read_gpx(gpx_file)
     lons = pts[:, 0]
     lats = pts[:, 1]
 
@@ -443,9 +732,9 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
     track_height_m = track_max_y_m - track_min_y_m
 
     # Canvas pixel sizes
-    canvas_width_px = int(round(cfg["width_cm"] * CM_TO_INCH * cfg["dpi"]))
-    canvas_height_px = int(round(cfg["height_cm"] * CM_TO_INCH * cfg["dpi"]))
-    pad_px = int(round(cfg["padding_cm"] * CM_TO_INCH * cfg["dpi"]))
+    canvas_width_px = int(round(args.width_cm * CM_TO_INCH * args.dpi))
+    canvas_height_px = int(round(args.height_cm * CM_TO_INCH * args.dpi))
+    pad_px = int(round(args.padding_cm * CM_TO_INCH * args.dpi))
     avail_width_px = canvas_width_px - 2 * pad_px
     avail_height_px = canvas_height_px - 2 * pad_px
     if avail_width_px <= 0 or avail_height_px <= 0:
@@ -456,8 +745,8 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
     mpp_y = track_height_m / float(avail_height_px)
     target_mpp = max(mpp_x, mpp_y)
 
-    tile_size = cfg["tile_size"]
-    map_z = choose_zoom_for_mpp(target_mpp, min_z=cfg["min_zoom"], max_z=cfg["max_zoom"], tile_size=tile_size)
+    tile_size = args.tile_size
+    map_z = choose_zoom_for_mpp(target_mpp, min_z=args.min_zoom, max_z=args.max_zoom, tile_size=tile_size)
     map_mpp = meters_per_pixel_for_zoom(map_z, tile_size=tile_size)
     logging.info(f"Using zoom level z={map_z}; resolution {map_mpp:.6f} m/px; target {target_mpp:.6f} m/px")
 
@@ -466,7 +755,6 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
     track_max_x_px, track_min_y_px = mercator_to_global_pixel(track_max_x_m, track_max_y_m, map_z, tile_size)
     track_width_px = track_max_x_px - track_min_x_px
     track_height_px = track_max_y_px - track_min_y_px
-    print(f"Target padding in px: {pad_px}, actual padding: {(canvas_width_px - track_width_px) // 2}, {(canvas_height_px - track_height_px) // 2}")
     zoom_factor_x = avail_width_px / float(track_width_px)
     zoom_factor_y = avail_height_px / float(track_height_px)
     zoom_factor = min(zoom_factor_x, zoom_factor_y)
@@ -474,7 +762,6 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
     zoom_center_y_m = 0.5 * (track_min_y_m + track_max_y_m)
     if zoom_factor > 1.0:
         logging.warning(f"Warning: Interpolation lost {100 * ():.2f}% image detail.")
-    print(zoom_factor, zoom_factor_x, zoom_factor_y)
     
     # center pixel for the track
     center_px_x = 0.5 * (track_min_x_px + track_max_x_px)
@@ -486,29 +773,48 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
     crop_max_x_px = crop_min_x_px + canvas_width_px / zoom_factor
     crop_max_y_px = crop_min_y_px + canvas_height_px / zoom_factor
     
-    # Elevation Processing
+    # Elevation/Speed Processing
     crop_min_lon, crop_min_lat = global_pixel_to_lonlat(crop_min_x_px, crop_max_y_px, map_z, tile_size)
     crop_max_lon, crop_max_lat = global_pixel_to_lonlat(crop_max_x_px, crop_min_y_px, map_z, tile_size)
-    elev_map, elev_transform = build_elevation_map(crop_min_lat, crop_max_lat, crop_min_lon, crop_max_lon)
-    elevs = sample_elevation_from_map(elev_map, elev_transform, lats, lons)
-    # Smooth the elevation profile using a simple moving average
-    window_size = min(user_config.get("smoothing_window", 10), len(elevs) // 10 + 1)  # Adaptive window size, max 50
-    if window_size >= 3 and window_size % 2 == 0:
-        window_size += 1  # Ensure odd window size for symmetry
-    if len(elevs) >= window_size:
-        elevs = np.convolve(elevs, np.ones(window_size) / window_size, mode='same')
     
-    # # Generate and save height map for fun
-    # height_array = rasterize_elevation_map(elev_map, elev_transform, crop_min_x_px, crop_max_x_px, crop_min_y_px, crop_max_y_px, map_z, tile_size)
-    # # normalize between height_array min/max
-    # ha_min = float(np.nanmin(height_array[height_array != 0]))
-    # ha_max = float(np.nanmax(height_array)) 
-    # height_array = (height_array - ha_min) / (ha_max - ha_min) * 255.0
-    # # save as image
-    # height_img = Image.fromarray(np.uint8(height_array), mode='L')
-    # height_img_path = Path(out_pdf).with_suffix(".elevation_map.png")
-    # height_img.save(height_img_path, dpi=(cfg["dpi"], cfg["dpi"]))
-    # logging.info(f"Saved elevation map to {height_img_path}")
+    if args.colorize_by == "elevation":
+        elev_map, elev_transform = build_elevation_map(crop_min_lat, crop_max_lat, crop_min_lon, crop_max_lon)
+        colorize_values = sample_elevation_from_map(elev_map, elev_transform, lats, lons)
+        # Smooth the elevation profile using a simple moving average
+        window_size = min(args.smoothing_window, len(colorize_values) // 10 + 1)  # Adaptive window size, max 50
+        if window_size >= 3 and window_size % 2 == 0:
+            window_size += 1  # Ensure odd window size for symmetry
+        if len(colorize_values) >= window_size:
+            colorize_values = np.convolve(colorize_values, np.ones(window_size) / window_size, mode='same')
+    elif args.colorize_by == "speed":
+        speeds = calculate_speeds_from_track(pts, times, unit=args.unit)
+        # For speed, we need one value per point, but speeds are per segment
+        # Extend speeds array to match points by duplicating the last speed
+        if len(speeds) > 0:
+            colorize_values = np.append(speeds, speeds[-1])
+        else:
+            colorize_values = np.zeros(len(pts))
+        # Smooth the speed profile using a simple moving average
+        window_size = min(args.smoothing_window, len(colorize_values) // 10 + 1)
+        if window_size >= 3 and window_size % 2 == 0:
+            window_size += 1
+        if len(colorize_values) >= window_size:
+            colorize_values = np.convolve(colorize_values, np.ones(window_size) / window_size, mode='same')
+    else:
+        raise ValueError(f"Unknown colorize_by value: {args.colorize_by}")
+    
+    # # Generate and save height map for fun (only for elevation mode)
+    # if args.colorize_by == "elevation":
+    #     height_array = rasterize_elevation_map(elev_map, elev_transform, crop_min_x_px, crop_max_x_px, crop_min_y_px, crop_max_y_px, map_z, tile_size)
+    #     # normalize between height_array min/max
+    #     ha_min = float(np.nanmin(height_array[height_array != 0]))
+    #     ha_max = float(np.nanmax(height_array)) 
+    #     height_array = (height_array - ha_min) / (ha_max - ha_min) * 255.0
+    #     # save as image
+    #     height_img = Image.fromarray(np.uint8(height_array), mode='L')
+    #     height_img_path = Path(out_pdf).with_suffix(".elevation_map.png")
+    #     height_img.save(height_img_path, dpi=(cfg["dpi"], cfg["dpi"]))
+    #     logging.info(f"Saved elevation map to {height_img_path}")
 
     tx_min, ty_min = global_pixel_to_tile(crop_min_x_px, crop_min_y_px, tile_size)
     tx_max, ty_max = global_pixel_to_tile(crop_max_x_px - 1, crop_max_y_px - 1, tile_size)
@@ -521,7 +827,7 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
 
     logging.info(f"Fetching tiles z={map_z}, x={tx_min}..{tx_max}, y={ty_min}..{ty_max}")
 
-    big_img, (origin_tx, origin_ty) = stitch_tiles(map_z, tx_min, tx_max, ty_min, ty_max, cfg)
+    big_img, (origin_tx, origin_ty) = stitch_tiles(map_z, tx_min, tx_max, ty_min, ty_max, args)
     global_origin_x_px = origin_tx * tile_size
     global_origin_y_px = origin_ty * tile_size
     # scale the big_img by zoom_factor
@@ -555,13 +861,13 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
         full.paste(content_img, (max(0, - (crop_min_x_px - global_origin_x_px)), max(0, - (crop_min_y_px - global_origin_y_px))))
         content_img = full
 
-    if cfg["save_background_png"]:
+    if args.save_bg:
         out_png = Path(out_pdf).with_suffix(".background.png")
-        content_img.save(out_png, dpi=(cfg["dpi"], cfg["dpi"]))
+        content_img.save(out_png, dpi=(args.dpi, args.dpi))
         logging.info(f"Saved assembled background to {out_png}")
 
     # compute bbox in mercator for the cropped full-page pixels
-    res = meters_per_pixel_for_zoom(map_z, tile_size=cfg["tile_size"])
+    res = meters_per_pixel_for_zoom(map_z, tile_size=args.tile_size)
     final_px_left = crop_min_x_px
     final_px_top = crop_min_y_px
     tl_x_m = final_px_left * res - HALF_WORLD
@@ -573,17 +879,25 @@ def process_gpx_to_pdf(gpx_file, out_pdf, user_config):
     bbox_maxx = max(tl_x_m, br_x_m)
     bbox_miny = min(br_y_m, tl_y_m)
     bbox_maxy = max(br_y_m, tl_y_m)
+    
+    settlements = load_settlements(
+        crop_min_lon,
+        crop_max_lon,
+        crop_min_lat,
+        crop_max_lat,
+        min_population=args.small_settlement_population
+    )
 
     # create the PDF with the assembled full-page background and vector track on top
-    create_pdf_with_track(
+    create_pdf_with_track_and_settlements(
         out_pdf,
         content_img,
-        track_points_x_m, track_points_y_m, elevs,
-        cfg,
+        track_points_x_m, track_points_y_m, colorize_values,
+        args,
         bbox_minx, bbox_miny, bbox_maxx, bbox_maxy,
-        cfg["padding_cm"],
-        zoom_center_x_m, zoom_center_y_m,
-        zoom_factor
+        args.padding_cm,
+        zoom_config={"center_x_m": zoom_center_x_m, "center_y_m": zoom_center_y_m, "factor": zoom_factor},
+        settlements=settlements
     )
 
     print("Done. PDF written to:", out_pdf)
@@ -594,36 +908,46 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Render GPX to a printable PDF with satellite backdrop.")
     ap.add_argument("gpx", help="Input GPX file")
     ap.add_argument("out_pdf", help="Output PDF file")
-    ap.add_argument("--width-cm", type=float, default=CONFIG["width_cm"])
-    ap.add_argument("--height-cm", type=float, default=CONFIG["height_cm"])
-    ap.add_argument("--padding-cm", type=float, default=CONFIG["padding_cm"])
-    ap.add_argument("--dpi", type=int, default=CONFIG["dpi"])
-    ap.add_argument("--cmap", type=str, default=CONFIG["colormap"])
-    ap.add_argument("--elev-min", type=float, default=None)
-    ap.add_argument("--elev-max", type=float, default=None)
-    ap.add_argument("--tile-cache", type=str, default=CONFIG["tile_cache_dir"])
-    ap.add_argument("--tile-url", type=str, default=CONFIG["tile_url_template"], help="Tile URL template with {z}/{x}/{y}")
-    ap.add_argument("--no-save-bg", dest="save_bg", action="store_false")
-    ap.add_argument("--smoothing-window", type=int, default=CONFIG["smoothing_window"], help="Smoothing window size for elevation profile")
+    ap.add_argument("--width-cm",                    default=10.0,      type=float, help="Width of the output PDF in centimeters")
+    ap.add_argument("--height-cm",                   default=10.0,      type=float, help="Height of the output PDF in centimeters")
+    ap.add_argument("--padding-cm",                  default=1.0,       type=float, help="Padding around the map in centimeters")
+    ap.add_argument("--dpi",                         default=800,       type=int,   help="Resolution of the output PDF in dots per inch")
+    ap.add_argument("--colorize-by",                 default="speed", choices=["elevation", "speed"], help="Colorize track by elevation or speed")
+    ap.add_argument("--unit",                        default="kt",      type=str,   help="Unit for colorization values: 'm' for elevation, 'm/s', 'km/h', 'kt', 'min/km' for speed")
+    ap.add_argument("--colorize-min-val",            default=None,      type=float, help="Minimum value for colormap normalization")
+    ap.add_argument("--colorize-max-val",            default=None,      type=float, help="Maximum value for colormap normalization")
+    ap.add_argument("--cmap",                        default="JET",     type=str,   help="Colormap for elevation profile (e.g., JET, HOT, RAINBOW)")
+    ap.add_argument("--elev-min",                    default=None,      type=float, help="Minimum elevation for colormap normalization")
+    ap.add_argument("--elev-max",                    default=None,      type=float, help="Maximum elevation for colormap normalization")
+    ap.add_argument("--tile-cache",                  default="./tiles", type=str,   help="Directory to cache downloaded map tiles")
+    ap.add_argument("--smoothing-window",            default=50,        type=int,   help="Smoothing window size for elevation profile")
+    ap.add_argument("--small-settlement-population", default=50_000,    type=int,   help="Minimum population count for a small settlement to appear on the map")
+    ap.add_argument("--large-settlement-population", default=500_000,   type=int,   help="Minimum population count for a large settlement marker")
+    ap.add_argument("--colored-track-pt",            default=1.0,       type=float, help="Width of colored track in points")
+    ap.add_argument("--white-halo-pt",               default=2.0,       type=float, help="Width of white halo around track in points")
+    ap.add_argument("--tile-size",                   default=256,       type=int,   help="Tile size in pixels")
+    ap.add_argument("--max-zoom",                    default=20,        type=int,   help="Maximum zoom level")
+    ap.add_argument("--min-zoom",                    default=0,         type=int,   help="Minimum zoom level")
+    ap.add_argument("--city-marker-width-pt",        default=10.0,      type=float, help="Width of city markers in points")
+    ap.add_argument("--start-goal-marker-width-pt",  default=15.0,      type=float, help="Width of start/goal markers in points")
+    ap.add_argument("--tile-url",                    default="https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg", type=str, help="Tile URL template with {z}/{x}/{y}")
+    ap.add_argument("--no-save-bg",    dest="save_bg",    action="store_false")
     ap.set_defaults(save_bg=True)
     return ap.parse_args()
 
 def main():
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
-    user_cfg = {
-        "width_cm": args.width_cm,
-        "height_cm": args.height_cm,
-        "padding_cm": args.padding_cm,
-        "dpi": args.dpi,
-        "colormap": args.cmap,
-        "elev_min": args.elev_min,
-        "elev_max": args.elev_max,
-        "tile_cache_dir": args.tile_cache,
-        "tile_url_template": args.tile_url,
-        "save_background_png": args.save_bg,
-    }
-    process_gpx_to_pdf(args.gpx, args.out_pdf, user_cfg)
+    args.annotation_color = (1.0, 1.0, 1.0)  # white (R, G, B values 0-1)
+    
+    # Set default units if not specified
+    if args.unit is None:
+        if args.colorize_by == "elevation":
+            args.unit = "m"
+        else:  # speed
+            args.unit = "km/h"
+    
+    process_gpx_to_pdf(args.gpx, args.out_pdf, args)
 
 if __name__ == "__main__":
     main()

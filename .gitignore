@@ -209,6 +209,7 @@ __marimo__/
 
 # Project related
 *tiles*
+*allCountries_cache*
 *.png
 *.pdf
 *.gpx
