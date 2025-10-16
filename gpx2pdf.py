@@ -629,7 +629,7 @@ def create_pdf_with_track_and_settlements(
         c.drawString(text_x, text_y, s_name)
 
     # Draw legend in bottom left
-    legend_square_size = 3.0 * (72.0 / 25.4)  # 5mm in points
+    legend_square_size = 4.0 * (72.0 / 25.4)  # 4mm in points
     legend_padding = 1.0 * (72.0 / 25.4)      # 1mm in points
     legend_start_x = 10.0 * (72.0 / 25.4)     # 10mm from left edge
     legend_start_y = 10.0 * (72.0 / 25.4)     # 10mm from bottom edge
@@ -707,6 +707,61 @@ def create_pdf_with_track_and_settlements(
         c.setFillColorRGB(*args.annotation_color)
         c.setFont("Helvetica", 8)
         c.drawString(text_x, text_y, text)
+
+    # Draw scale bar in bottom right
+    scale_margin = 10.0 * (72.0 / 25.4)  # 10mm from edges
+    scale_start_x = page_w_pt - scale_margin
+    scale_start_y = 10.0 * (72.0 / 25.4)  # 10mm from bottom
+    max_scale_width_pt = args.max_scale_width_mm * (72.0 / 25.4)
+    
+    # Calculate scale based on meters per point
+    possible_scales = []  # in meters
+    for exp in range(1, 10):
+        for base in [1, 2.5, 5]:
+            possible_scales.append(int(base * (10 ** exp)))
+    scale_distance = None
+    scale_width_pt = None
+    
+    for scale_m in possible_scales:
+        width_pt = scale_m / meters_per_pt
+        if width_pt <= max_scale_width_pt:
+            scale_distance = scale_m
+            scale_width_pt = width_pt
+        else:
+            break
+    
+    if scale_distance is not None:
+        # Draw scale line
+        scale_line_x1 = scale_start_x - scale_width_pt
+        scale_line_x2 = scale_start_x
+        scale_line_y = scale_start_y
+        
+        c.setStrokeColorRGB(*args.annotation_color)
+        c.setLineWidth(1.0)
+        
+        # Main horizontal line
+        c.line(scale_line_x1, scale_line_y, scale_line_x2, scale_line_y)
+        
+        # Left serif
+        serif_length = 5.0  # 5 points
+        c.line(scale_line_x1, scale_line_y - serif_length/2, scale_line_x1, scale_line_y + serif_length/2)
+        
+        # Right serif
+        c.line(scale_line_x2, scale_line_y - serif_length/2, scale_line_x2, scale_line_y + serif_length/2)
+        
+        # Scale text
+        if scale_distance >= 1000:
+            scale_text = f"{scale_distance // 1000} km"
+        else:
+            scale_text = f"{scale_distance} m"
+        
+        c.setFont("Helvetica", 8)
+        text_width = c.stringWidth(scale_text, "Helvetica", 8)
+        text_x = scale_line_x1 + (scale_width_pt - text_width) / 2.0  # Center text above scale
+        text_y = scale_line_y + 8  # 8 points above scale line
+        
+        c.setFillColorRGB(*args.annotation_color)
+        c.drawString(text_x, text_y, scale_text)
 
     c.showPage()
     c.save()
@@ -930,6 +985,7 @@ def parse_args():
     ap.add_argument("--min-zoom",                    default=0,         type=int,   help="Minimum zoom level")
     ap.add_argument("--city-marker-width-pt",        default=10.0,      type=float, help="Width of city markers in points")
     ap.add_argument("--start-goal-marker-width-pt",  default=15.0,      type=float, help="Width of start/goal markers in points")
+    ap.add_argument("--max-scale-width-mm",          default=30.0,      type=float, help="Maximum width of scale bar in millimeters")
     ap.add_argument("--tile-url",                    default="https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg", type=str, help="Tile URL template with {z}/{x}/{y}")
     ap.add_argument("--no-save-bg",    dest="save_bg",    action="store_false")
     ap.set_defaults(save_bg=True)
