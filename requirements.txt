@@ -11,3 +11,7 @@ rasterio
 geopandas
 shapely
 svglib
+
+scikit-image>=0.21
+scipy>=1.10
+trimesh

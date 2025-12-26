@@ -6,3 +6,7 @@ __pycache__/
 *.gpx
 *.pdf
 *.png
+
+# temp memmaps created by depth_map.py
+depth_map_elev_*.mmap
+*.mmap

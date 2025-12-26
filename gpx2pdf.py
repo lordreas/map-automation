@@ -19,6 +19,7 @@ import argparse
 import logging
 from io import BytesIO
 from pathlib import Path
+import pickle
 import zipfile
 import pandas as pd
 from tqdm.auto import tqdm
@@ -243,7 +244,7 @@ def stitch_tiles(z, tx_min, tx_max, ty_min, ty_max, args):
                 p.update(1)
     return big, (tx_min, ty_min)
 
-def build_elevation_map(lat_min, lat_max, lon_min, lon_max, zoom=12, cache_dir="./elevation_tiles"):
+def build_elevation_map(lat_min, lat_max, lon_min, lon_max, zoom=12, cache_dir="./elevation_tiles", cache_array=False):
     """
     Download and assemble SRTM (NASADEM) elevation tiles for the bounding box.
     Tiles are cached in `cache_dir`. The assembled result is returned as a
@@ -253,6 +254,16 @@ def build_elevation_map(lat_min, lat_max, lon_min, lon_max, zoom=12, cache_dir="
     https://elevation-tiles-prod.s3.amazonaws.com
     """
     os.makedirs(cache_dir, exist_ok=True)
+    
+    array_cache_path = os.path.join(cache_dir, f"elevation_{lat_min}_{lat_max}_{lon_min}_{lon_max}.npy")
+    transform_cache_path = os.path.join(cache_dir, f"elevation_{lat_min}_{lat_max}_{lon_min}_{lon_max}_transform.pkl")
+    if cache_array and os.path.exists(array_cache_path):
+        print(f"Loading cached elevation array from {array_cache_path} ...")
+        elev_array = np.load(array_cache_path)
+        with open(transform_cache_path, "rb") as f:
+            out_trans = pickle.load(f)
+        return elev_array, out_trans
+    
     # Approximate tile coverage in 1x1 degree steps
     lat_range = range(int(math.floor(lat_min)), int(math.ceil(lat_max)))
     lon_range = range(int(math.floor(lon_min)), int(math.ceil(lon_max)))
@@ -288,6 +299,12 @@ def build_elevation_map(lat_min, lat_max, lon_min, lon_max, zoom=12, cache_dir="
     mosaic, out_trans = merge(src_files_to_mosaic)
     for src in src_files_to_mosaic:
         src.close()
+    
+    if cache_array:
+        np.save(array_cache_path, mosaic[0])
+        with open(transform_cache_path, "wb") as f:
+            pickle.dump(out_trans, f)
+        
 
     return mosaic[0], out_trans
 
@@ -816,8 +833,12 @@ def process_gpx_to_pdf(gpx_file, out_pdf, args):
     zoom_center_x_m = 0.5 * (track_min_x_m + track_max_x_m)
     zoom_center_y_m = 0.5 * (track_min_y_m + track_max_y_m)
     if zoom_factor > 1.0:
-        logging.warning(f"Warning: Interpolation lost {100 * ():.2f}% image detail.")
-    
+        # zoom_factor > 1 => we're upscaling (interpolating) tiles; report "native detail kept"
+        native_detail_kept_pct = 100.0 / float(zoom_factor)
+        logging.warning(
+            f"Warning: upscaling by {zoom_factor:.2f}x; native detail kept ~{native_detail_kept_pct:.1f}%."
+        )
+
     # center pixel for the track
     center_px_x = 0.5 * (track_min_x_px + track_max_x_px)
     center_px_y = 0.5 * (track_min_y_px + track_max_y_px)
@@ -830,7 +851,7 @@ def process_gpx_to_pdf(gpx_file, out_pdf, args):
     
     # Elevation/Speed Processing
     crop_min_lon, crop_min_lat = global_pixel_to_lonlat(crop_min_x_px, crop_max_y_px, map_z, tile_size)
-    crop_max_lon, crop_max_lat = global_pixel_to_lonlat(crop_max_x_px, crop_min_y_px, map_z, tile_size)
+    crop_max_lon, crop_max_lat = global_pixel_to_lonlat(crop_max_x_px - 1, crop_max_y_px - 1, map_z, tile_size)
     
     if args.colorize_by == "elevation":
         elev_map, elev_transform = build_elevation_map(crop_min_lat, crop_max_lat, crop_min_lon, crop_max_lon)
@@ -963,10 +984,10 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Render GPX to a printable PDF with satellite backdrop.")
     ap.add_argument("gpx", help="Input GPX file")
     ap.add_argument("out_pdf", help="Output PDF file")
-    ap.add_argument("--width-cm",                    default=10.0,      type=float, help="Width of the output PDF in centimeters")
-    ap.add_argument("--height-cm",                   default=10.0,      type=float, help="Height of the output PDF in centimeters")
+    ap.add_argument("--width-cm",                    default=12.7,      type=float, help="Width of the output PDF in centimeters")
+    ap.add_argument("--height-cm",                   default=12.7,      type=float, help="Height of the output PDF in centimeters")
     ap.add_argument("--padding-cm",                  default=1.0,       type=float, help="Padding around the map in centimeters")
-    ap.add_argument("--dpi",                         default=800,       type=int,   help="Resolution of the output PDF in dots per inch")
+    ap.add_argument("--dpi",                         default=450,       type=int,   help="Resolution of the output PDF in dots per inch")
     ap.add_argument("--colorize-by",                 default="speed", choices=["elevation", "speed"], help="Colorize track by elevation or speed")
     ap.add_argument("--unit",                        default="kt",      type=str,   help="Unit for colorization values: 'm' for elevation, 'm/s', 'km/h', 'kt', 'min/km' for speed")
     ap.add_argument("--colorize-min-val",            default=None,      type=float, help="Minimum value for colormap normalization")
@@ -976,7 +997,7 @@ def parse_args():
     ap.add_argument("--elev-max",                    default=None,      type=float, help="Maximum elevation for colormap normalization")
     ap.add_argument("--tile-cache",                  default="./tiles", type=str,   help="Directory to cache downloaded map tiles")
     ap.add_argument("--smoothing-window",            default=50,        type=int,   help="Smoothing window size for elevation profile")
-    ap.add_argument("--small-settlement-population", default=50_000,    type=int,   help="Minimum population count for a small settlement to appear on the map")
+    ap.add_argument("--small-settlement-population", default=10_000,    type=int,   help="Minimum population count for a small settlement to appear on the map")
     ap.add_argument("--large-settlement-population", default=500_000,   type=int,   help="Minimum population count for a large settlement marker")
     ap.add_argument("--colored-track-pt",            default=1.0,       type=float, help="Width of colored track in points")
     ap.add_argument("--white-halo-pt",               default=2.0,       type=float, help="Width of white halo around track in points")
