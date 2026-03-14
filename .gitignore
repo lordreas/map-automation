@@ -10,3 +10,5 @@ __pycache__/
 # temp memmaps created by depth_map.py
 depth_map_elev_*.mmap
 *.mmap
+*.stl
+*.obj

@@ -4,7 +4,9 @@ import numpy as np
 import heapq
 import os
 import tempfile
+from collections import deque
 from pathlib import Path
+from dataclasses import dataclass
 from multiprocessing import get_context
 import logging
 import time
@@ -104,10 +106,10 @@ class Timer:
 def parse_args():
     ap = argparse.ArgumentParser(description="Generate corridor masks for splitting an elevation map into printable tiles.")
     # bbox for build_elevation_map (same data source you already use)
-    ap.add_argument("--lat-min", default=46.0, type=float)
-    ap.add_argument("--lat-max", default=46.5, type=float)
-    ap.add_argument("--lon-min", default=8.0, type=float)
-    ap.add_argument("--lon-max", default=8.5, type=float)
+    ap.add_argument("--lat-min", default=42.75, type=float)
+    ap.add_argument("--lat-max", default=48.5, type=float)
+    ap.add_argument("--lon-min", default=4.5, type=float)
+    ap.add_argument("--lon-max", default=17, type=float)
 
     # all physical parameters in mm
     ap.add_argument("--final-width-mm",   default=1500, type=float, help="Assembled final print width (mm)")
@@ -169,6 +171,19 @@ def parse_args():
         type=float,
         help="Total clearance gap between tiles (mm). Edges are offset by half this amount.",
     )
+    ap.add_argument(
+        "--nozzle-diameter-mm",
+        default=0.4,
+        type=float,
+        help="Approximate nozzle diameter used to choose a pre-processing raster resolution (mm).",
+    )
+    ap.add_argument(
+        "--resampling-interval-mm",
+        dest="resampling_interval_mm",
+        default=2.0,
+        type=float,
+        help="Maximum segment length used when resampling graph edges on the printed/output map (mm).",
+    )
     return ap.parse_args()
 
 
@@ -228,6 +243,183 @@ def fit_mm_bbox_preserve_aspect_ratio(bbox_w_mm: float, bbox_h_mm: float, aspect
         eff_w = float(bbox_w_mm)
         eff_h = eff_w / float(aspect_w_over_h)
     return eff_w, eff_h
+
+
+def _uniform_filter_reflect(arr: np.ndarray, size: int) -> np.ndarray:
+    arr = np.asarray(arr, dtype=float)
+    if size <= 1:
+        return arr.copy()
+    pad = int(size // 2)
+    padded = np.pad(arr, ((pad, pad), (pad, pad)), mode="reflect")
+    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant", constant_values=0.0)
+    integral = np.cumsum(np.cumsum(integral, axis=0), axis=1)
+    sums = (
+        integral[size:, size:]
+        - integral[:-size, size:]
+        - integral[size:, :-size]
+        + integral[:-size, :-size]
+    )
+    return sums / float(size * size)
+
+
+def _pad_for_half_sampling(arr: np.ndarray, fill_edge: bool = True) -> np.ndarray:
+    arr = np.asarray(arr)
+    pad_h = int(arr.shape[0] % 2)
+    pad_w = int(arr.shape[1] % 2)
+    if pad_h == 0 and pad_w == 0:
+        return arr
+    if fill_edge:
+        return np.pad(arr, ((0, pad_h), (0, pad_w)), mode="edge")
+    return np.pad(arr, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=False)
+
+
+def _masked_block_median(blocks: np.ndarray, valid_blocks: np.ndarray) -> np.ndarray:
+    h2, _, w2, _ = blocks.shape
+    flat = blocks.transpose(0, 2, 1, 3).reshape(h2, w2, 4)
+    valid_flat = valid_blocks.transpose(0, 2, 1, 3).reshape(h2, w2, 4)
+    counts = valid_flat.sum(axis=-1)
+    safe = np.where(valid_flat, flat, np.inf)
+    safe.sort(axis=-1)
+    lo_idx = np.clip((counts - 1) // 2, 0, 3)[..., None]
+    hi_idx = np.clip(counts // 2, 0, 3)[..., None]
+    lo = np.take_along_axis(safe, lo_idx, axis=-1)[..., 0]
+    hi = np.take_along_axis(safe, hi_idx, axis=-1)[..., 0]
+    med = 0.5 * (lo + hi)
+    med[counts == 0] = np.nan
+    return med
+
+
+def downsample_minmax_half(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    valid = np.isfinite(arr)
+    if not np.any(valid):
+        new_h = max(1, (arr.shape[0] + 1) // 2)
+        new_w = max(1, (arr.shape[1] + 1) // 2)
+        return np.full((new_h, new_w), np.nan, dtype=np.float32)
+
+    arr_pad = _pad_for_half_sampling(arr, fill_edge=True)
+    valid_pad = _pad_for_half_sampling(valid, fill_edge=False)
+
+    global_fill = float(np.nanmedian(arr[valid]))
+    valid_f = valid_pad.astype(np.float32)
+    mean_vals = _uniform_filter_reflect(np.where(valid_pad, arr_pad, 0.0), size=25)
+    mean_mask = _uniform_filter_reflect(valid_f, size=25)
+    local_fill = np.divide(
+        mean_vals,
+        np.maximum(mean_mask, 1e-12),
+        out=np.full_like(mean_vals, global_fill, dtype=float),
+        where=mean_mask > 1e-12,
+    )
+    arr_filled = np.where(valid_pad, arr_pad, local_fill)
+
+    smooth = _uniform_filter_reflect(arr_filled, size=25)
+    lap_large = smooth - arr_filled
+
+    h2 = arr_pad.shape[0] // 2
+    w2 = arr_pad.shape[1] // 2
+    blocks = arr_filled.reshape(h2, 2, w2, 2)
+    valid_blocks = valid_pad.reshape(h2, 2, w2, 2)
+    any_valid = valid_blocks.any(axis=(1, 3))
+
+    bmin = np.min(np.where(valid_blocks, blocks, np.inf), axis=(1, 3))
+    bmax = np.max(np.where(valid_blocks, blocks, -np.inf), axis=(1, 3))
+    bmed = _masked_block_median(blocks, valid_blocks)
+    bmin[~any_valid] = np.nan
+    bmax[~any_valid] = np.nan
+
+    lap_blocks = lap_large.reshape(h2, 2, w2, 2).mean(axis=(1, 3))
+    abs_lap = np.abs(lap_blocks[any_valid])
+    threshold = float(np.percentile(abs_lap, 25)) if abs_lap.size else 0.0
+
+    out = np.where(
+        lap_blocks > threshold,
+        bmin,
+        np.where(lap_blocks < -threshold, bmax, bmed),
+    ).astype(np.float32, copy=False)
+    out[~any_valid] = np.nan
+    return out
+
+
+def downsample_elevation_map_for_nozzle(
+    elev_map: np.ndarray,
+    *,
+    eff_width_mm: float,
+    eff_height_mm: float,
+    nozzle_diameter_mm: float,
+) -> tuple[np.ndarray, int]:
+    elev_map = np.asarray(elev_map, dtype=np.float32)
+    if nozzle_diameter_mm <= 0:
+        raise ValueError("--nozzle-diameter-mm must be > 0")
+
+    target_mm_per_px = float(nozzle_diameter_mm) / 2.0
+    out = elev_map
+    steps = 0
+
+    while min(out.shape) >= 2:
+        next_h = max(1, (out.shape[0] + 1) // 2)
+        next_w = max(1, (out.shape[1] + 1) // 2)
+        next_mm_per_px_x = float(eff_width_mm) / float(next_w)
+        next_mm_per_px_y = float(eff_height_mm) / float(next_h)
+        if next_mm_per_px_x > target_mm_per_px or next_mm_per_px_y > target_mm_per_px:
+            break
+        out = downsample_minmax_half(out)
+        steps += 1
+
+    return out, steps
+
+
+@dataclass
+class RasterContext:
+    elev_map: np.ndarray
+    img_h: int
+    img_w: int
+    bbox_w_m: float
+    bbox_h_m: float
+    eff_width_mm: float
+    eff_height_mm: float
+
+    @property
+    def mm_per_px_x(self) -> float:
+        return float(self.eff_width_mm) / float(max(1, self.img_w))
+
+    @property
+    def mm_per_px_y(self) -> float:
+        return float(self.eff_height_mm) / float(max(1, self.img_h))
+
+    @property
+    def mppx(self) -> float:
+        return float(self.bbox_w_m) / float(max(1, self.img_w - 1))
+
+    @property
+    def mppy(self) -> float:
+        return float(self.bbox_h_m) / float(max(1, self.img_h - 1))
+
+    @property
+    def extent_m(self) -> tuple[float, float, float, float]:
+        return (0.0, float(self.bbox_w_m), float(self.bbox_h_m), 0.0)
+
+
+@dataclass
+class TilingPlan:
+    corridors: list[dict]
+    col_starts_px: list[int]
+    row_starts_px: list[int]
+    overlap_px_x: int
+    overlap_px_y: int
+
+
+@dataclass
+class IntersectionMetrics:
+    img_h: int
+    img_w: int
+    bbox_w_m: float
+    bbox_h_m: float
+    eff_width_mm: float
+    eff_height_mm: float
+    mm_per_px_x: float
+    mm_per_px_y: float
+    mppx: float
+    mppy: float
 
 
 def _px_to_m_x(x_px: np.ndarray, img_w: int, bbox_w_m: float) -> np.ndarray:
@@ -529,7 +721,60 @@ def _coords_metric_xy(coords_rc: list[np.ndarray], mppx: float, mppy: float) -> 
     return np.column_stack([cols * float(mppx), rows * float(mppy)])
 
 
-def build_graph_from_polylines(polylines_rc: list[np.ndarray], mppx: float, mppy: float, quantize_q: float = 2.0):
+def _pixel_edge_step_m(mppx: float, mppy: float) -> float:
+    steps = [float(v) for v in (mppx, mppy) if np.isfinite(v) and float(v) > 0.0]
+    return min(steps) if steps else 0.0
+
+
+def _add_resampled_edge(
+    coords_rc: list[np.ndarray],
+    adj: dict[int, list[tuple[int, float]]],
+    u: int,
+    v: int,
+    *,
+    mppx: float,
+    mppy: float,
+    max_step_m: float,
+):
+    if u == v:
+        return
+
+    max_step_m = float(max_step_m)
+    if max_step_m <= 0.0:
+        w_m = _metric_len_rc(coords_rc[u], coords_rc[v], mppx=mppx, mppy=mppy)
+        adj[u].append((v, float(w_m)))
+        adj[v].append((u, float(w_m)))
+        return
+
+    p0 = np.asarray(coords_rc[u], dtype=float)
+    p1 = np.asarray(coords_rc[v], dtype=float)
+    total_m = _metric_len_rc(p0, p1, mppx=mppx, mppy=mppy)
+    segments = max(1, int(np.ceil(total_m / max_step_m)))
+    prev = int(u)
+
+    for step in range(1, segments):
+        t = float(step) / float(segments)
+        point_rc = ((1.0 - t) * p0) + (t * p1)
+        nid = len(coords_rc)
+        coords_rc.append(np.asarray(point_rc, dtype=float))
+        adj[nid] = []
+        w_m = _metric_len_rc(coords_rc[prev], coords_rc[nid], mppx=mppx, mppy=mppy)
+        adj[prev].append((nid, float(w_m)))
+        adj[nid].append((prev, float(w_m)))
+        prev = nid
+
+    w_m = _metric_len_rc(coords_rc[prev], coords_rc[v], mppx=mppx, mppy=mppy)
+    adj[prev].append((v, float(w_m)))
+    adj[v].append((prev, float(w_m)))
+
+
+def build_graph_from_polylines(
+    polylines_rc: list[np.ndarray],
+    mppx: float,
+    mppy: float,
+    quantize_q: float = 2.0,
+    resample_step_m: Optional[float] = None,
+):
     """
     Build an undirected weighted graph from polylines in (row,col).
     Edge weights are metric lengths (meters), not pixel lengths.
@@ -537,6 +782,11 @@ def build_graph_from_polylines(polylines_rc: list[np.ndarray], mppx: float, mppy
     key_to_id: dict[tuple[int, int], int] = {}
     coords: list[np.ndarray] = []
     adj: dict[int, list[tuple[int, float]]] = {}
+    max_step_m = (
+        float(resample_step_m)
+        if resample_step_m is not None and np.isfinite(resample_step_m) and float(resample_step_m) > 0.0
+        else 0.0
+    )
 
     def get_node_id(p_rc: np.ndarray) -> int:
         key = _quantize_rc(p_rc, quantize_q)
@@ -548,12 +798,6 @@ def build_graph_from_polylines(polylines_rc: list[np.ndarray], mppx: float, mppy
             adj[nid] = []
         return nid
 
-    def add_edge(u: int, v: int, w_m: float):
-        if u == v:
-            return
-        adj[u].append((v, float(w_m)))
-        adj[v].append((u, float(w_m)))
-
     for pl in polylines_rc:
         pts = np.asarray(pl, dtype=float)
         if pts.shape[0] < 2:
@@ -561,11 +805,18 @@ def build_graph_from_polylines(polylines_rc: list[np.ndarray], mppx: float, mppy
         prev = get_node_id(pts[0])
         for k in range(1, pts.shape[0]):
             cur = get_node_id(pts[k])
-            w_m = _metric_len_rc(coords[prev], coords[cur], mppx=mppx, mppy=mppy)
-            add_edge(prev, cur, w_m)
+            _add_resampled_edge(
+                coords,
+                adj,
+                prev,
+                cur,
+                mppx=mppx,
+                mppy=mppy,
+                max_step_m=max_step_m,
+            )
             prev = cur
 
-    return coords, adj
+    return coords, adj, key_to_id
 
 
 def connected_components(adj: dict[int, list[tuple[int, float]]]) -> list[list[int]]:
@@ -807,6 +1058,7 @@ def connect_components_by_nearest_mst(
     adj: dict[int, list[tuple[int, float]]],
     mppx: float,
     mppy: float,
+    resample_step_m: Optional[float] = None,
 ):
     """
     Connect disjoint components with exactly (k-1) bridges (MST-style), using nearest points in 2D metric space.
@@ -819,11 +1071,19 @@ def connect_components_by_nearest_mst(
     xy_all = _coords_metric_xy(coords, mppx=mppx, mppy=mppy)
 
     def add_bridge(u: int, v: int):
-        dx = float(xy_all[u, 0] - xy_all[v, 0])
-        dy = float(xy_all[u, 1] - xy_all[v, 1])
-        w_m = float(np.hypot(dx, dy))
-        adj[u].append((v, w_m))
-        adj[v].append((u, w_m))
+        _add_resampled_edge(
+            coords,
+            adj,
+            u,
+            v,
+            mppx=mppx,
+            mppy=mppy,
+            max_step_m=(
+                float(resample_step_m)
+                if resample_step_m is not None and np.isfinite(resample_step_m) and float(resample_step_m) > 0.0
+                else 0.0
+            ),
+        )
 
     while len(comps) > 1:
         best = (float("inf"), None, None, None, None)  # dist, i, j, u, v
@@ -907,6 +1167,7 @@ def extend_graph_to_axis_borders(
     border_max: float,
     mppx: float,
     mppy: float,
+    resample_step_m: Optional[float] = None,
     eps: float = 1e-6,
 ) -> tuple[int, int]:
     """
@@ -929,9 +1190,19 @@ def extend_graph_to_axis_borders(
         nid = len(coords)
         coords.append(new_p)
         adj[nid] = []
-        w_m = _metric_len_rc(coords[from_id], new_p, mppx=mppx, mppy=mppy)
-        adj[from_id].append((nid, float(w_m)))
-        adj[nid].append((from_id, float(w_m)))
+        _add_resampled_edge(
+            coords,
+            adj,
+            from_id,
+            nid,
+            mppx=mppx,
+            mppy=mppy,
+            max_step_m=(
+                float(resample_step_m)
+                if resample_step_m is not None and np.isfinite(resample_step_m) and float(resample_step_m) > 0.0
+                else 0.0
+            ),
+        )
         return nid
 
     start_id = min_id
@@ -953,17 +1224,21 @@ def add_proximity_edges_within_component_radius(
     mppy: float,
     radius_m: float,
     alpha: float = 2.0,
+    resample_step_m: Optional[float] = None,
 ):
     """
-    Within ONE connected component, add an undirected edge between candidate node pairs within radius_m,
-    but skip "path-neighborhood" edges:
+    Over the provided node set, add an undirected edge between candidate node pairs within radius_m.
+
+    For node pairs already connected in the snapshot graph, skip "path-neighborhood" edges:
 
       Add (u,v) only if d_graph(u,v) > alpha * d_direct(u,v),
 
     where d_graph is shortest-path distance in the CURRENT subgraph (snapshot before adding new edges)
     and d_direct is 2D Euclidean metric distance.
 
-    Does NOT add edges to other components.
+    For node pairs in different snapshot components, add the edge directly if they are within radius_m.
+    Accepted shortcut edges are resampled so later reduction passes can reason about them instead of
+    seeing one long hop.
     """
     if radius_m is None or float(radius_m) <= 0.0:
         return
@@ -975,10 +1250,15 @@ def add_proximity_edges_within_component_radius(
 
     comp_set = set(int(i) for i in node_ids)
 
-    # Snapshot adjacency (only within this component) so decisions don't change while we add edges.
+    # Snapshot adjacency restricted to the provided node set so decisions don't change while we add edges.
     adj0: dict[int, list[tuple[int, float]]] = {}
     for u in comp_set:
         adj0[u] = [(v, float(w)) for (v, w) in adj.get(u, []) if v in comp_set]
+
+    comp_index: dict[int, int] = {}
+    for comp_i, comp in enumerate(connected_components(adj0)):
+        for u in comp:
+            comp_index[int(u)] = int(comp_i)
 
     ids = np.asarray(list(comp_set), dtype=int)
     # stable order for local indexing
@@ -986,18 +1266,30 @@ def add_proximity_edges_within_component_radius(
     xy = _coords_metric_xy([coords_rc[i] for i in ids], mppx=mppx, mppy=mppy)  # (n,2) meters
     r = float(radius_m)
     eps = 1e-9
+    pixel_step_m = (
+        float(resample_step_m)
+        if resample_step_m is not None and np.isfinite(resample_step_m) and float(resample_step_m) > 0.0
+        else _pixel_edge_step_m(mppx, mppy)
+    )
 
     added: set[tuple[int, int]] = set()
 
-    def add_edge(u: int, v: int, w_m: float):
+    def add_edge(u: int, v: int):
         if u == v:
             return
         a, b = (u, v) if u < v else (v, u)
         if (a, b) in added:
             return
         added.add((a, b))
-        adj[u].append((v, float(w_m)))
-        adj[v].append((u, float(w_m)))
+        _add_resampled_edge(
+            coords_rc,
+            adj,
+            u,
+            v,
+            mppx=mppx,
+            mppy=mppy,
+            max_step_m=pixel_step_m,
+        )
 
     def dijkstra_limited(start: int, cutoff: float) -> dict[int, float]:
         dist: dict[int, float] = {start: 0.0}
@@ -1023,9 +1315,11 @@ def add_proximity_edges_within_component_radius(
             if not neigh:
                 continue
 
-            # prepare targets (only lj>li to avoid duplicates)
+            # prepare same-component targets (only lj>li to avoid duplicates)
             targets: list[tuple[int, float]] = []
             max_direct = 0.0
+            u = int(ids[li])
+            comp_u = comp_index.get(u, -1)
             for lj in neigh:
                 lj = int(lj)
                 if lj <= li:
@@ -1035,49 +1329,54 @@ def add_proximity_edges_within_component_radius(
                 d_direct = float(np.hypot(dx, dy))
                 if d_direct <= 0.0 or d_direct > r + eps:
                     continue
-                targets.append((lj, d_direct))
-                if d_direct > max_direct:
-                    max_direct = d_direct
+                v = int(ids[lj])
+                if comp_index.get(v, -1) != comp_u:
+                    add_edge(u, v)
+                    continue
+                targets.append((v, d_direct))
+                max_direct = max(max_direct, d_direct)
 
             if not targets:
                 continue
 
-            u = int(ids[li])
             cutoff = alpha * max_direct
             dist_u = dijkstra_limited(u, cutoff=cutoff)
 
-            for lj, d_direct in targets:
-                v = int(ids[lj])
+            for v, d_direct in targets:
                 d_graph = dist_u.get(v, float("inf"))
                 if d_graph > alpha * d_direct + eps:
-                    add_edge(u, v, d_direct)
+                    add_edge(u, v)
     else:
-        # brute-force fallback (component-local)
+        # brute-force fallback
         n = xy.shape[0]
         for li in range(n):
             targets: list[tuple[int, float]] = []
             max_direct = 0.0
+            u = int(ids[li])
+            comp_u = comp_index.get(u, -1)
             for lj in range(li + 1, n):
                 dx = float(xy[li, 0] - xy[lj, 0])
                 dy = float(xy[li, 1] - xy[lj, 1])
                 d_direct = float(np.hypot(dx, dy))
-                if d_direct <= r + eps:
-                    targets.append((lj, d_direct))
-                    if d_direct > max_direct:
-                        max_direct = d_direct
+                if d_direct <= 0.0 or d_direct > r + eps:
+                    continue
+                v = int(ids[lj])
+                if comp_index.get(v, -1) != comp_u:
+                    add_edge(u, v)
+                    continue
+                targets.append((v, d_direct))
+                max_direct = max(max_direct, d_direct)
 
             if not targets:
                 continue
 
-            u = int(ids[li])
             cutoff = alpha * max_direct
             dist_u = dijkstra_limited(u, cutoff=cutoff)
 
-            for lj, d_direct in targets:
-                v = int(ids[lj])
+            for v, d_direct in targets:
                 d_graph = dist_u.get(v, float("inf"))
                 if d_graph > alpha * d_direct + eps:
-                    add_edge(u, v, d_direct)
+                    add_edge(u, v)
 
 
 def build_separating_line_for_corridor(
@@ -1093,6 +1392,7 @@ def build_separating_line_for_corridor(
     interval_m: float,
     reversal_split_mm: float,
     neighbor_radius_mm: float,
+    resampling_interval_mm: float,
     skip_alpha: float,
 ):
     """
@@ -1144,35 +1444,36 @@ def build_separating_line_for_corridor(
     # meters-per-pixel for the full raster (metric edge weights)
     mppx = float(bbox_w_m) / float(max(1, img_w - 1))
     mppy = float(bbox_h_m) / float(max(1, img_h - 1))
+    meters_per_mm_w = float(bbox_w_m) / float(max(1e-9, eff_width_mm))
+    meters_per_mm_h = float(bbox_h_m) / float(max(1e-9, eff_height_mm))
+    meters_per_mm = 0.5 * (meters_per_mm_w + meters_per_mm_h)
+    resample_step_m = float(resampling_interval_mm) * meters_per_mm
 
-    coords, adj = build_graph_from_polylines(
+    coords, adj, _key_to_id = build_graph_from_polylines(
         selected_segments_crop_rc,
         mppx=mppx,
         mppy=mppy,
         quantize_q=2.0,
+        resample_step_m=resample_step_m,
     )
     if not coords:
         return None
 
     # neighbor radius specified in mm on output map -> meters in-world
-    meters_per_mm_w = float(bbox_w_m) / float(max(1e-9, eff_width_mm))
-    meters_per_mm_h = float(bbox_h_m) / float(max(1e-9, eff_height_mm))
-    meters_per_mm = 0.5 * (meters_per_mm_w + meters_per_mm_h)
     neighbor_radius_m = float(neighbor_radius_mm) * meters_per_mm
 
-    comps_pre = connected_components(adj)
-    for comp in comps_pre:
-        add_proximity_edges_within_component_radius(
-            coords,
-            adj,
-            node_ids=comp,
-            mppx=mppx,
-            mppy=mppy,
-            radius_m=neighbor_radius_m,
-            alpha=float(skip_alpha),
-        )
+    add_proximity_edges_within_component_radius(
+        coords,
+        adj,
+        node_ids=list(adj.keys()),
+        mppx=mppx,
+        mppy=mppy,
+        radius_m=neighbor_radius_m,
+        alpha=float(skip_alpha),
+        resample_step_m=resample_step_m,
+    )
 
-    connect_components_by_nearest_mst(coords, adj, mppx=mppx, mppy=mppy)
+    connect_components_by_nearest_mst(coords, adj, mppx=mppx, mppy=mppy, resample_step_m=resample_step_m)
 
     crop_h, crop_w = crop.shape
     border_min = 0.0
@@ -1185,6 +1486,7 @@ def build_separating_line_for_corridor(
         border_max=border_max,
         mppx=mppx,
         mppy=mppy,
+        resample_step_m=resample_step_m,
     )
 
     path_ids = dijkstra_path(adj, start_id, end_id)
@@ -1385,8 +1687,21 @@ def create_extruded_tool(
     # Ensure closed polygon
     if not np.allclose(boundary_points[0], boundary_points[-1]):
         boundary_points = np.vstack([boundary_points, boundary_points[0]])
-        
+
     poly = Polygon(boundary_points)
+    if not poly.is_valid:
+        repaired = poly.buffer(0)
+        if repaired.is_empty:
+            raise ValueError("Boundary polygon could not be repaired")
+        if repaired.geom_type == "Polygon":
+            poly = repaired
+        elif hasattr(repaired, "geoms"):
+            polys = [g for g in repaired.geoms if g.geom_type == "Polygon"]
+            if not polys:
+                raise ValueError("Boundary repair did not produce a polygon")
+            poly = max(polys, key=lambda p: p.area)
+        else:
+            raise ValueError("Boundary repair produced unsupported geometry")
     # Simplify slightly to reduce vertex count if needed, but separating lines are critical
     # poly = poly.simplify(0.1, preserve_topology=True) 
     
@@ -1466,6 +1781,32 @@ def save_lines_obj(path: str, lines: list[np.ndarray], z: float = 0.0):
             vertex_offset += len(line)
 
 
+def save_graph_obj(
+    path: str,
+    coords_rc: list[np.ndarray],
+    adj: dict[int, list[tuple[int, float]]],
+    *,
+    mm_per_px_x: float,
+    mm_per_px_y: float,
+    z: float = 0.0,
+):
+    with open(path, "w") as f:
+        f.write("# Intersection search graph\n")
+        for point_rc in coords_rc:
+            x_mm = float(point_rc[1]) * float(mm_per_px_x)
+            y_mm = float(point_rc[0]) * float(mm_per_px_y)
+            f.write(f"v {x_mm:.4f} {y_mm:.4f} {float(z):.4f}\n")
+
+        seen: set[tuple[int, int]] = set()
+        for u, neighbors in adj.items():
+            for v, _w in neighbors:
+                a, b = (int(u), int(v)) if int(u) < int(v) else (int(v), int(u))
+                if a == b or (a, b) in seen:
+                    continue
+                seen.add((a, b))
+                f.write(f"l {a + 1} {b + 1}\n")
+
+
 def _worker_build_corridor_line(args):
     """
     Multiprocessing worker: open elev_map via memmap and compute one corridor line.
@@ -1485,6 +1826,7 @@ def _worker_build_corridor_line(args):
         interval_m,
         reversal_split_mm,
         neighbor_radius_mm,
+        resampling_interval_mm,
         skip_alpha,
     ) = args
 
@@ -1503,6 +1845,7 @@ def _worker_build_corridor_line(args):
         interval_m=interval_m,
         reversal_split_mm=reversal_split_mm,
         neighbor_radius_mm=neighbor_radius_mm,
+        resampling_interval_mm=resampling_interval_mm,
         skip_alpha=skip_alpha,
     )
     if rc is None:
@@ -1521,11 +1864,18 @@ def _worker_build_corridor_line(args):
     }
 
 
-def main():
-    logging.basicConfig(level=logging.INFO)
-    log = logging.getLogger("depth_map")
-    args = parse_args()
+def _neighbor_radius_m_from_context(ctx, neighbor_radius_mm: float) -> float:
+    meters_per_mm_w = float(ctx.bbox_w_m) / float(max(1e-9, ctx.eff_width_mm))
+    meters_per_mm_h = float(ctx.bbox_h_m) / float(max(1e-9, ctx.eff_height_mm))
+    meters_per_mm = 0.5 * (meters_per_mm_w + meters_per_mm_h)
+    return float(neighbor_radius_mm) * meters_per_mm
 
+
+def _corridor_key(corridor: dict) -> tuple[str, int]:
+    return (str(corridor["kind"]), int(corridor["i"]))
+
+
+def load_raster_context(args, log: logging.Logger) -> RasterContext:
     with Timer("load elevation_map", log):
         elev_map, _elev_transform = build_elevation_map(
             args.lat_min, args.lat_max, args.lon_min, args.lon_max, cache_array=True
@@ -1535,93 +1885,134 @@ def main():
         elev_map = np.asarray(elev_map, dtype=np.float32)
         img_h, img_w = elev_map.shape
 
-    # local CRS only for correct aspect (meters)
     local_crs = choose_local_crs(args.lat_min, args.lat_max, args.lon_min, args.lon_max)
     _, _, _, _, bbox_w_m, bbox_h_m = project_bbox_to_local_m(
         args.lat_min, args.lat_max, args.lon_min, args.lon_max, local_crs
     )
     aspect_m = bbox_w_m / float(bbox_h_m) if bbox_h_m else (img_w / float(img_h))
-
     eff_width_mm, eff_height_mm = fit_mm_bbox_preserve_aspect_ratio(
         args.final_width_mm, args.final_height_mm, aspect_m
     )
 
-    # tile planning
-    col_starts_mm = plan_tile_starts_mm(eff_width_mm, args.bed_width_mm, args.overlap_width_mm)
-    row_starts_mm = plan_tile_starts_mm(eff_height_mm, args.bed_height_mm, args.overlap_width_mm)
-    col_starts_px = [_mm_to_px_x(mm, eff_width_mm, img_w) for mm in col_starts_mm]
-    row_starts_px = [_mm_to_px_y(mm, eff_height_mm, img_h) for mm in row_starts_mm]
-    overlap_px_x = _mm_to_px_x(args.overlap_width_mm, eff_width_mm, img_w)
-    overlap_px_y = _mm_to_px_y(args.overlap_width_mm, eff_height_mm, img_h)
+    with Timer("downsample elevation_map", log):
+        elev_map, downsample_steps = downsample_elevation_map_for_nozzle(
+            elev_map,
+            eff_width_mm=float(eff_width_mm),
+            eff_height_mm=float(eff_height_mm),
+            nozzle_diameter_mm=float(args.nozzle_diameter_mm),
+        )
+    img_h, img_w = elev_map.shape
+    log.info(
+        "downsampled raster: %dx%d (steps=%d, nozzle=%.3fmm, mm/px=%.4f x %.4f)",
+        img_h,
+        img_w,
+        downsample_steps,
+        float(args.nozzle_diameter_mm),
+        float(eff_width_mm) / float(max(1, img_w)),
+        float(eff_height_mm) / float(max(1, img_h)),
+    )
+
+    return RasterContext(
+        elev_map=elev_map,
+        img_h=img_h,
+        img_w=img_w,
+        bbox_w_m=float(bbox_w_m),
+        bbox_h_m=float(bbox_h_m),
+        eff_width_mm=float(eff_width_mm),
+        eff_height_mm=float(eff_height_mm),
+    )
+
+
+def plan_tiling(ctx: RasterContext, args) -> TilingPlan:
+    col_starts_mm = plan_tile_starts_mm(ctx.eff_width_mm, args.bed_width_mm, args.overlap_width_mm)
+    row_starts_mm = plan_tile_starts_mm(ctx.eff_height_mm, args.bed_height_mm, args.overlap_width_mm)
+    col_starts_px = [_mm_to_px_x(mm, ctx.eff_width_mm, ctx.img_w) for mm in col_starts_mm]
+    row_starts_px = [_mm_to_px_y(mm, ctx.eff_height_mm, ctx.img_h) for mm in row_starts_mm]
+    overlap_px_x = _mm_to_px_x(args.overlap_width_mm, ctx.eff_width_mm, ctx.img_w)
+    overlap_px_y = _mm_to_px_y(args.overlap_width_mm, ctx.eff_height_mm, ctx.img_h)
 
     corridors = []
     for i in range(1, len(col_starts_px)):
         x0 = int(col_starts_px[i])
-        x1 = int(min(img_w, x0 + overlap_px_x))
+        x1 = int(min(ctx.img_w, x0 + overlap_px_x))
         if x1 > x0:
-            corridors.append({"kind": "col", "i": i, "x0": x0, "x1": x1, "y0": 0, "y1": img_h})
+            corridors.append({"kind": "col", "i": i, "x0": x0, "x1": x1, "y0": 0, "y1": ctx.img_h})
     for i in range(1, len(row_starts_px)):
         y0 = int(row_starts_px[i])
-        y1 = int(min(img_h, y0 + overlap_px_y))
+        y1 = int(min(ctx.img_h, y0 + overlap_px_y))
         if y1 > y0:
-            corridors.append({"kind": "row", "i": i, "x0": 0, "x1": img_w, "y0": y0, "y1": y1})
+            corridors.append({"kind": "row", "i": i, "x0": 0, "x1": ctx.img_w, "y0": y0, "y1": y1})
 
-    if not corridors:
+    return TilingPlan(
+        corridors=corridors,
+        col_starts_px=col_starts_px,
+        row_starts_px=row_starts_px,
+        overlap_px_x=overlap_px_x,
+        overlap_px_y=overlap_px_y,
+    )
+
+
+def resolve_worker_count(requested_workers: int) -> int:
+    if int(requested_workers) > 0:
+        return int(requested_workers)
+    return min((os.cpu_count() or 1), 4)
+
+
+def compute_corridor_lines_parallel(
+    ctx: RasterContext,
+    plan: TilingPlan,
+    args,
+    workers: int,
+    log: logging.Logger,
+) -> list[dict]:
+    if not plan.corridors:
         raise RuntimeError("No corridors computed (check bed/overlap/final size settings).")
-
-    extent_m = (0.0, float(bbox_w_m), float(bbox_h_m), 0.0)  # origin upper => y down
 
     interval = float(args.elevation_interval_m)
     if interval <= 0:
         raise ValueError("--elevation-interval-m must be > 0")
+    if float(args.resampling_interval_mm) <= 0:
+        raise ValueError("--resamplin-interval-mm must be > 0")
 
-    # --- multiprocessing over corridors ---
-    # Conservative default to avoid Windows pagefile/RAM blowups during spawn.
-    if int(args.workers) > 0:
-        workers = int(args.workers)
-    else:
-        workers = min((os.cpu_count() or 1), 4)
-
-    # Disk-backed memmap instead of shared_memory (Windows-friendly for big arrays)
     tmp_dir = Path(tempfile.gettempdir())
     mmap_path = str(tmp_dir / f"depth_map_elev_{os.getpid()}.mmap")
 
     with Timer("write memmap", log):
-        mm = np.memmap(mmap_path, dtype=elev_map.dtype, mode="w+", shape=elev_map.shape)
-        mm[:] = elev_map
+        mm = np.memmap(mmap_path, dtype=ctx.elev_map.dtype, mode="w+", shape=ctx.elev_map.shape)
+        mm[:] = ctx.elev_map
         mm.flush()
         del mm
 
     try:
         job_args = [
             (
-                c,
+                corridor,
                 mmap_path,
-                elev_map.shape,
-                str(elev_map.dtype),
-                img_h,
-                img_w,
-                float(bbox_w_m),
-                float(bbox_h_m),
-                float(eff_width_mm),
-                float(eff_height_mm),
+                ctx.elev_map.shape,
+                str(ctx.elev_map.dtype),
+                ctx.img_h,
+                ctx.img_w,
+                float(ctx.bbox_w_m),
+                float(ctx.bbox_h_m),
+                float(ctx.eff_width_mm),
+                float(ctx.eff_height_mm),
                 float(interval),
                 float(args.reversal_split_mm),
                 float(args.neighbor_radius_mm),
+                float(args.resampling_interval_mm),
                 float(args.skip_alpha),
             )
-            for c in corridors
+            for corridor in plan.corridors
         ]
 
         results = []
         with Timer("compute corridor lines (multiprocessing)", log):
-            ctx = get_context("spawn")
-            with ctx.Pool(processes=workers) as pool:
+            ctx_mp = get_context("spawn")
+            with ctx_mp.Pool(processes=workers) as pool:
                 it = pool.imap_unordered(_worker_build_corridor_line, job_args, chunksize=1)
-                for r in tqdm(it, total=len(job_args), desc="Corridors", unit="corridor"):
-                    if r is not None:
-                        results.append(r)
-
+                for result in tqdm(it, total=len(job_args), desc="Corridors", unit="corridor"):
+                    if result is not None:
+                        results.append(result)
     finally:
         try:
             os.remove(mmap_path)
@@ -1631,171 +2022,607 @@ def main():
     if not results:
         raise RuntimeError("No corridor lines were produced.")
 
-    log.info("corridor lines produced: %d / %d", len(results), len(corridors))
+    log.info("corridor lines produced: %d / %d", len(results), len(plan.corridors))
     log.info("avg corridor time: %.3fs", float(np.mean([r["t_sec"] for r in results])) if results else 0.0)
+    return results
 
-    # --- plot full map + all corridor lines (existing behavior) ---
+
+def _line_rc_from_result(result: dict) -> np.ndarray:
+    return np.column_stack((result["rows_full"], result["cols_full"])).astype(float, copy=False)
+
+
+def _result_from_line_rc(result: dict, line_rc: np.ndarray, ctx: RasterContext) -> dict:
+    rows_full = np.asarray(line_rc[:, 0], dtype=np.float32)
+    cols_full = np.asarray(line_rc[:, 1], dtype=np.float32)
+    return {
+        "corridor": result["corridor"],
+        "rows_full": rows_full,
+        "cols_full": cols_full,
+        "xs_m": _px_to_m_x(cols_full, ctx.img_w, ctx.bbox_w_m).astype(np.float32, copy=False),
+        "ys_m": _px_to_m_y(rows_full, ctx.img_h, ctx.bbox_h_m).astype(np.float32, copy=False),
+        "t_sec": result.get("t_sec", 0.0),
+    }
+
+
+def _find_inside_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return []
+    runs: list[tuple[int, int]] = []
+    start = int(idx[0])
+    prev = int(idx[0])
+    for cur in idx[1:]:
+        cur = int(cur)
+        if cur == prev + 1:
+            prev = cur
+            continue
+        runs.append((start, prev))
+        start = cur
+        prev = cur
+    runs.append((start, prev))
+    return runs
+
+
+def extract_line_section_in_square(
+    line_rc: np.ndarray,
+    *,
+    center_mm: np.ndarray,
+    half_width_mm: float,
+    mm_per_px_x: float,
+    mm_per_px_y: float,
+    axis_idx: int,
+) -> Optional[dict]:
+    if line_rc.shape[0] < 2:
+        return None
+
+    pts_mm = np.column_stack((line_rc[:, 1] * mm_per_px_x, line_rc[:, 0] * mm_per_px_y))
+    delta_mm = np.abs(pts_mm - center_mm[None, :])
+    inside = (delta_mm[:, 0] <= float(half_width_mm)) & (delta_mm[:, 1] <= float(half_width_mm))
+    runs = _find_inside_runs(inside)
+    if not runs:
+        return None
+
+    best = None
+    best_score = (-1.0, -1)
+    for start, end in runs:
+        ext_start = max(0, start - 1)
+        ext_end = min(line_rc.shape[0] - 1, end + 1)
+        section = line_rc[ext_start : ext_end + 1]
+        axis_extent = float(np.max(section[:, axis_idx]) - np.min(section[:, axis_idx]))
+        score = (axis_extent, section.shape[0])
+        if score > best_score:
+            best_score = score
+            best = {
+                "start_idx": ext_start,
+                "end_idx": ext_end,
+                "section_rc": np.asarray(section, dtype=float),
+            }
+    return best
+
+
+def _orient_replacement_path(section_rc: np.ndarray, replacement_rc: np.ndarray) -> np.ndarray:
+    if replacement_rc.shape[0] < 2:
+        return replacement_rc
+    d_forward = float(np.linalg.norm(replacement_rc[0] - section_rc[0])) + float(
+        np.linalg.norm(replacement_rc[-1] - section_rc[-1])
+    )
+    d_reverse = float(np.linalg.norm(replacement_rc[-1] - section_rc[0])) + float(
+        np.linalg.norm(replacement_rc[0] - section_rc[-1])
+    )
+    return replacement_rc if d_forward <= d_reverse else replacement_rc[::-1].copy()
+
+
+def _node_id_for_point(key_to_id: dict[tuple[int, int], int], point_rc: np.ndarray, quantize_q: float = 2.0) -> Optional[int]:
+    return key_to_id.get(_quantize_rc(point_rc, quantize_q))
+
+
+def _edge_key(u: int, v: int) -> tuple[int, int]:
+    return (int(u), int(v)) if int(u) < int(v) else (int(v), int(u))
+
+
+def _path_edge_keys(path_ids: list[int]) -> set[tuple[int, int]]:
+    return {_edge_key(path_ids[i - 1], path_ids[i]) for i in range(1, len(path_ids)) if path_ids[i - 1] != path_ids[i]}
+
+
+def _polyline_node_ids(
+    key_to_id: dict[tuple[int, int], int],
+    polyline_rc: np.ndarray,
+    quantize_q: float = 2.0,
+) -> list[int]:
+    out: list[int] = []
+    for point_rc in np.asarray(polyline_rc, dtype=float):
+        nid = _node_id_for_point(key_to_id, point_rc, quantize_q=quantize_q)
+        if nid is None:
+            continue
+        if not out or out[-1] != int(nid):
+            out.append(int(nid))
+    return out
+
+
+def _edge_length_map(adj: dict[int, list[tuple[int, float]]]) -> dict[tuple[int, int], float]:
+    out: dict[tuple[int, int], float] = {}
+    for u, neighbors in adj.items():
+        for v, w in neighbors:
+            key = _edge_key(u, v)
+            if key not in out:
+                out[key] = float(w)
+    return out
+
+
+def _cycle_edge_keys(adj: dict[int, list[tuple[int, float]]]) -> set[tuple[int, int]]:
+    nbrs: dict[int, set[int]] = {int(u): {int(v) for v, _w in neighbors} for u, neighbors in adj.items()}
+    deg = {u: len(vs) for u, vs in nbrs.items()}
+    queue = deque(u for u, d in deg.items() if d < 2)
+
+    while queue:
+        u = int(queue.popleft())
+        if deg.get(u, 0) >= 2:
+            continue
+        for v in list(nbrs.get(u, set())):
+            nbrs[v].discard(u)
+            deg[v] = len(nbrs[v])
+            if deg[v] == 1:
+                queue.append(v)
+        nbrs[u].clear()
+        deg[u] = 0
+
+    cycle_edges: set[tuple[int, int]] = set()
+    for u, vs in nbrs.items():
+        for v in vs:
+            if u < v:
+                cycle_edges.add((u, v))
+    return cycle_edges
+
+
+def _remove_edges_by_key(adj: dict[int, list[tuple[int, float]]], edge_keys: set[tuple[int, int]]):
+    if not edge_keys:
+        return
+    for u in list(adj.keys()):
+        adj[u] = [(v, w) for (v, w) in adj[u] if _edge_key(u, v) not in edge_keys]
+
+
+def _build_local_replacement_paths(
+    vertical_section: np.ndarray,
+    horizontal_section: np.ndarray,
+    *,
+    ctx,
+    neighbor_radius_mm: float,
+    resampling_interval_mm: float,
+    skip_alpha: float,
+    graph_obj_path: Optional[str] = None,
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    resample_step_m = _neighbor_radius_m_from_context(ctx, resampling_interval_mm)
+    coords, adj, key_to_id = build_graph_from_polylines(
+        [vertical_section, horizontal_section],
+        mppx=ctx.mppx,
+        mppy=ctx.mppy,
+        quantize_q=2.0,
+        resample_step_m=resample_step_m,
+    )
+    if not coords:
+        return None
+
+    neighbor_radius_m = _neighbor_radius_m_from_context(ctx, neighbor_radius_mm)
+    add_proximity_edges_within_component_radius(
+        coords,
+        adj,
+        node_ids=list(adj.keys()),
+        mppx=ctx.mppx,
+        mppy=ctx.mppy,
+        radius_m=neighbor_radius_m,
+        alpha=float(skip_alpha),
+        resample_step_m=resample_step_m,
+    )
+
+    connect_components_by_nearest_mst(
+        coords,
+        adj,
+        mppx=ctx.mppx,
+        mppy=ctx.mppy,
+        resample_step_m=resample_step_m,
+    )
+
+    if graph_obj_path:
+        save_graph_obj(
+            graph_obj_path,
+            coords,
+            adj,
+            mm_per_px_x=ctx.mm_per_px_x,
+            mm_per_px_y=ctx.mm_per_px_y,
+        )
+
+    top_pt = vertical_section[int(np.argmin(vertical_section[:, 0]))]
+    bottom_pt = vertical_section[int(np.argmax(vertical_section[:, 0]))]
+    left_pt = horizontal_section[int(np.argmin(horizontal_section[:, 1]))]
+    right_pt = horizontal_section[int(np.argmax(horizontal_section[:, 1]))]
+
+    top_id = _node_id_for_point(key_to_id, top_pt)
+    bottom_id = _node_id_for_point(key_to_id, bottom_pt)
+    left_id = _node_id_for_point(key_to_id, left_pt)
+    right_id = _node_id_for_point(key_to_id, right_pt)
+    if None in (top_id, bottom_id, left_id, right_id):
+        return None
+
+    quadrant_specs = [
+        ("tr", int(top_id), int(right_id)),
+        ("rb", int(right_id), int(bottom_id)),
+        ("bl", int(bottom_id), int(left_id)),
+        ("lt", int(left_id), int(top_id)),
+    ]
+    quadrant_polylines: dict[str, np.ndarray] = {}
+    for label, start_id, end_id in quadrant_specs:
+        path_ids = dijkstra_path(adj, start_id, end_id)
+        if not path_ids:
+            return None
+        quadrant_polylines[label] = np.array([coords[n] for n in path_ids], dtype=float)
+
+    border_coords, border_adj, border_key_to_id = build_graph_from_polylines(
+        [quadrant_polylines[label] for label, _start_id, _end_id in quadrant_specs],
+        mppx=ctx.mppx,
+        mppy=ctx.mppy,
+        quantize_q=2.0,
+        resample_step_m=0.0,
+    )
+    if not border_coords:
+        return None
+
+    top_border_id = _node_id_for_point(border_key_to_id, top_pt)
+    bottom_border_id = _node_id_for_point(border_key_to_id, bottom_pt)
+    left_border_id = _node_id_for_point(border_key_to_id, left_pt)
+    right_border_id = _node_id_for_point(border_key_to_id, right_pt)
+    if None in (top_border_id, bottom_border_id, left_border_id, right_border_id):
+        return None
+
+    quadrant_edge_keys: dict[str, set[tuple[int, int]]] = {}
+    for label, polyline_rc in quadrant_polylines.items():
+        path_ids = _polyline_node_ids(border_key_to_id, polyline_rc, quantize_q=2.0)
+        if len(path_ids) < 2:
+            return None
+        quadrant_edge_keys[label] = _path_edge_keys(path_ids)
+
+    edge_lengths = _edge_length_map(border_adj)
+    while True:
+        cycle_edges = _cycle_edge_keys(border_adj)
+        if not cycle_edges:
+            break
+
+        best_label = None
+        best_shared_edges: set[tuple[int, int]] = set()
+        best_shared_len = 0.0
+        for label, path_edges in quadrant_edge_keys.items():
+            shared_edges = cycle_edges & path_edges
+            shared_len = float(sum(edge_lengths.get(edge, 0.0) for edge in shared_edges))
+            if shared_len > best_shared_len:
+                best_shared_len = shared_len
+                best_shared_edges = shared_edges
+                best_label = label
+
+        if best_label is None or not best_shared_edges:
+            break
+        _remove_edges_by_key(border_adj, best_shared_edges)
+
+    vertical_path_ids = dijkstra_path(border_adj, int(top_border_id), int(bottom_border_id))
+    horizontal_path_ids = dijkstra_path(border_adj, int(left_border_id), int(right_border_id))
+    if not vertical_path_ids or not horizontal_path_ids:
+        return None
+
+    vertical_path = np.array([border_coords[n] for n in vertical_path_ids], dtype=float)
+    horizontal_path = np.array([border_coords[n] for n in horizontal_path_ids], dtype=float)
+    return vertical_path, horizontal_path
+
+
+def _intersection_replacement_task(task: dict) -> Optional[dict]:
+    col_result = task["col_result"]
+    row_result = task["row_result"]
+    center_mm = np.asarray(task["center_mm"], dtype=float)
+    half_width_mm = float(task["half_width_mm"])
+    ctx = task["ctx"]
+
+    col_line_rc = _line_rc_from_result(col_result)
+    row_line_rc = _line_rc_from_result(row_result)
+
+    col_section = extract_line_section_in_square(
+        col_line_rc,
+        center_mm=center_mm,
+        half_width_mm=half_width_mm,
+        mm_per_px_x=ctx.mm_per_px_x,
+        mm_per_px_y=ctx.mm_per_px_y,
+        axis_idx=0,
+    )
+    row_section = extract_line_section_in_square(
+        row_line_rc,
+        center_mm=center_mm,
+        half_width_mm=half_width_mm,
+        mm_per_px_x=ctx.mm_per_px_x,
+        mm_per_px_y=ctx.mm_per_px_y,
+        axis_idx=1,
+    )
+    if col_section is None or row_section is None:
+        return None
+
+    local_paths = _build_local_replacement_paths(
+        col_section["section_rc"],
+        row_section["section_rc"],
+        ctx=ctx,
+        neighbor_radius_mm=float(task["neighbor_radius_mm"]),
+        resampling_interval_mm=float(task["resampling_interval_mm"]),
+        skip_alpha=float(task["skip_alpha"]),
+        graph_obj_path=task.get("graph_obj_path"),
+    )
+    if local_paths is None:
+        return None
+
+    col_replacement = _orient_replacement_path(col_section["section_rc"], local_paths[0])
+    row_replacement = _orient_replacement_path(row_section["section_rc"], local_paths[1])
+
+    return {
+        "col_key": task["col_key"],
+        "row_key": task["row_key"],
+        "col_replacement": {
+            "start_idx": int(col_section["start_idx"]),
+            "end_idx": int(col_section["end_idx"]),
+            "replacement_rc": col_replacement,
+        },
+        "row_replacement": {
+            "start_idx": int(row_section["start_idx"]),
+            "end_idx": int(row_section["end_idx"]),
+            "replacement_rc": row_replacement,
+        },
+    }
+
+
+def _concat_polyline_parts(parts: list[np.ndarray]) -> np.ndarray:
+    clean_parts = [np.asarray(part, dtype=float) for part in parts if part is not None and part.size > 0]
+    if not clean_parts:
+        return np.zeros((0, 2), dtype=float)
+    out = [clean_parts[0]]
+    for part in clean_parts[1:]:
+        cur = part
+        if np.allclose(out[-1][-1], cur[0]):
+            cur = cur[1:]
+        if cur.size > 0:
+            out.append(cur)
+    return np.vstack(out)
+
+
+def apply_replacements_to_line(line_rc: np.ndarray, replacements: list[dict]) -> np.ndarray:
+    if not replacements:
+        return np.asarray(line_rc, dtype=float)
+
+    current = np.asarray(line_rc, dtype=float)
+    offset = 0
+    for repl in sorted(replacements, key=lambda item: item["start_idx"]):
+        start_idx = int(repl["start_idx"]) + offset
+        end_idx = int(repl["end_idx"]) + offset
+        if start_idx < 0 or end_idx >= current.shape[0] or start_idx > end_idx:
+            continue
+        replacement_rc = _orient_replacement_path(current[start_idx : end_idx + 1], np.asarray(repl["replacement_rc"], dtype=float))
+        current = _concat_polyline_parts(
+            [
+                current[:start_idx],
+                replacement_rc,
+                current[end_idx + 1 :],
+            ]
+        )
+        offset += replacement_rc.shape[0] - (end_idx - start_idx + 1)
+    return current
+
+
+def refine_intersections_parallel(
+    results: list[dict],
+    ctx: RasterContext,
+    args,
+    workers: int,
+    log: logging.Logger,
+) -> list[dict]:
+    col_results = [r for r in results if r["corridor"]["kind"] == "col"]
+    row_results = [r for r in results if r["corridor"]["kind"] == "row"]
+    if not col_results or not row_results:
+        return results
+
+    graph_out_dir = (Path(args.mesh_out_dir).expanduser() if str(args.mesh_out_dir).strip() else Path.cwd()) / "intersection_graphs"
+    graph_out_dir.mkdir(parents=True, exist_ok=True)
+
+    metric_ctx = IntersectionMetrics(
+        img_h=ctx.img_h,
+        img_w=ctx.img_w,
+        bbox_w_m=ctx.bbox_w_m,
+        bbox_h_m=ctx.bbox_h_m,
+        eff_width_mm=ctx.eff_width_mm,
+        eff_height_mm=ctx.eff_height_mm,
+        mm_per_px_x=ctx.mm_per_px_x,
+        mm_per_px_y=ctx.mm_per_px_y,
+        mppx=ctx.mppx,
+        mppy=ctx.mppy,
+    )
+
+    tasks = []
+    for col_result in col_results:
+        col_corridor = col_result["corridor"]
+        center_x_mm = 0.5 * (float(col_corridor["x0"]) + float(col_corridor["x1"])) * ctx.mm_per_px_x
+        for row_result in row_results:
+            row_corridor = row_result["corridor"]
+            center_y_mm = 0.5 * (float(row_corridor["y0"]) + float(row_corridor["y1"])) * ctx.mm_per_px_y
+            graph_obj_path = graph_out_dir / f"crossing_col_{int(col_corridor['i']):02d}_row_{int(row_corridor['i']):02d}.obj"
+            tasks.append(
+                {
+                    "col_key": _corridor_key(col_corridor),
+                    "row_key": _corridor_key(row_corridor),
+                    "col_result": col_result,
+                    "row_result": row_result,
+                    "center_mm": np.array([center_x_mm, center_y_mm], dtype=float),
+                    "half_width_mm": 0.5 * float(args.overlap_width_mm),
+                    "neighbor_radius_mm": float(args.neighbor_radius_mm),
+                    "resampling_interval_mm": float(args.resampling_interval_mm),
+                    "skip_alpha": float(args.skip_alpha),
+                    "graph_obj_path": str(graph_obj_path),
+                    "ctx": metric_ctx,
+                }
+            )
+
+    if not tasks:
+        return results
+
+    processes = max(1, min(len(tasks), max(1, workers)))
+    replacements_by_key: dict[tuple[str, int], list[dict]] = {}
+    applied_pairs = 0
+
+    with Timer("refine intersections (multiprocessing)", log):
+        ctx_mp = get_context("spawn")
+        with ctx_mp.Pool(processes=processes) as pool:
+            it = pool.imap_unordered(_intersection_replacement_task, tasks, chunksize=1)
+            for replacement in tqdm(it, total=len(tasks), desc="Intersections", unit="pair"):
+                if replacement is None:
+                    continue
+                replacements_by_key.setdefault(replacement["col_key"], []).append(replacement["col_replacement"])
+                replacements_by_key.setdefault(replacement["row_key"], []).append(replacement["row_replacement"])
+                applied_pairs += 1
+
+    log.info("intersection replacements produced: %d / %d", applied_pairs, len(tasks))
+    log.info("intersection search graphs written to: %s", str(graph_out_dir))
+
+    refined_results = []
+    for result in results:
+        line_rc = _line_rc_from_result(result)
+        key = _corridor_key(result["corridor"])
+        replacements = replacements_by_key.get(key, [])
+        refined_line = apply_replacements_to_line(line_rc, replacements)
+        refined_results.append(_result_from_line_rc(result, refined_line, ctx))
+
+    return refined_results
+
+
+def plot_corridor_lines(results: list[dict], ctx: RasterContext, args):
     fig, axp = plt.subplots(figsize=(12, 6))
-    axp.imshow(elev_map, cmap="terrain", origin="upper", extent=extent_m)
+    axp.imshow(ctx.elev_map, cmap="terrain", origin="upper", extent=ctx.extent_m)
     axp.set_aspect("equal", adjustable="box")
-
-    for r in results:
-        axp.plot(r["xs_m"], r["ys_m"], color="black", linewidth=1.0)
-
+    for result in results:
+        axp.plot(result["xs_m"], result["ys_m"], color="black", linewidth=1.0)
     axp.set_title(
-        f"All corridors | interval={interval:.0f} m | neighbor_r={float(args.neighbor_radius_mm):.1f} mm | "
-        f"alpha={float(args.skip_alpha):.2f} | workers={workers} | lines={len(results)}"
+        f"All corridors | interval={float(args.elevation_interval_m):.0f} m | neighbor_r={float(args.neighbor_radius_mm):.1f} mm | "
+        f"resample={float(args.resampling_interval_mm):.1f} mm | alpha={float(args.skip_alpha):.2f} | lines={len(results)}"
     )
     axp.set_axis_off()
     plt.tight_layout()
 
-    if not args.export_meshes:
-        plt.show()
-        return
 
-    # --- Generate Full Mesh ---
-    mm_per_px_x = float(eff_width_mm) / float(img_w)
-    mm_per_px_y = float(eff_height_mm) / float(img_h)
-    
+def export_tile_meshes(
+    results: list[dict],
+    ctx: RasterContext,
+    plan: TilingPlan,
+    args,
+    log: logging.Logger,
+):
     out_dir = Path(args.mesh_out_dir).expanduser() if str(args.mesh_out_dir).strip() else Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Export corridor lines as OBJ
     lines_mm = []
-    for r in results:
-        pts_mm = np.column_stack((
-            r["cols_full"] * mm_per_px_x,
-            r["rows_full"] * mm_per_px_y
-        ))
+    for result in results:
+        pts_mm = np.column_stack((result["cols_full"] * ctx.mm_per_px_x, result["rows_full"] * ctx.mm_per_px_y))
         lines_mm.append(pts_mm)
-    
     z_lines = args.bottom_thickness_mm + args.desired_height_mm + 0.5
     save_lines_obj(str(out_dir / "corridor_lines.obj"), lines_mm, z=z_lines)
     log.info("Exported corridor_lines.obj")
 
     with Timer("generate full mesh", log):
         full_mesh = generate_full_mesh(
-            elev_map,
-            mm_per_px_x=mm_per_px_x,
-            mm_per_px_y=mm_per_px_y,
+            ctx.elev_map,
+            mm_per_px_x=ctx.mm_per_px_x,
+            mm_per_px_y=ctx.mm_per_px_y,
             bottom_thickness_mm=args.bottom_thickness_mm,
-            desired_height_mm=args.desired_height_mm
+            desired_height_mm=args.desired_height_mm,
         )
         if not full_mesh.is_volume:
             log.warning("Full mesh is not a watertight volume! Boolean operations may fail.")
-        
-    # --- Prepare Tools ---
-    # Organize lines by index
-    col_lines = {}
-    row_lines = {}
-    for r in results:
-        c = r["corridor"]
-        # Convert px lines to mm
-        pts_mm = np.column_stack((
-            r["cols_full"] * mm_per_px_x,
-            r["rows_full"] * mm_per_px_y
-        ))
-        if c["kind"] == "col":
-            col_lines[c["i"]] = pts_mm
+
+    col_lines: dict[int, np.ndarray] = {}
+    row_lines: dict[int, np.ndarray] = {}
+    for result in results:
+        corridor = result["corridor"]
+        pts_mm = np.column_stack((result["cols_full"] * ctx.mm_per_px_x, result["rows_full"] * ctx.mm_per_px_y))
+        if corridor["kind"] == "col":
+            col_lines[int(corridor["i"])] = pts_mm
         else:
-            row_lines[c["i"]] = pts_mm
+            row_lines[int(corridor["i"])] = pts_mm
 
     z_min = -1.0
     z_max = args.bottom_thickness_mm + args.desired_height_mm + 1.0
-    
-    nx = len(col_starts_px)
-    ny = len(row_starts_px)
-    
-    # out_dir created above
-
-    # Try to use manifold engine
+    nx = len(plan.col_starts_px)
+    ny = len(plan.row_starts_px)
     boolean_engine = None
     try:
-        # Simple check if we can import it or if trimesh detects it
-        # trimesh.boolean.intersection([], engine='manifold')
-        boolean_engine = 'manifold'
+        boolean_engine = "manifold"
     except Exception:
         pass
 
     half_clearance = args.fitting_clearance / 2.0
-
     with Timer("process tiles (boolean)", log):
         for ty in range(ny):
-            # Build Row Tool
-            # Top boundary
-            if ty == 0:
-                top_line = np.array([[0, 0], [eff_width_mm, 0]])
-            else:
-                # Offset Right (down/inwards)
-                top_line = offset_polyline(row_lines[ty], -half_clearance, constrain_axis=0)
-                
-            # Bottom boundary
-            if ty == ny - 1:
-                bot_line = np.array([[0, eff_height_mm], [eff_width_mm, eff_height_mm]])
-            else:
-                # Offset Left (up/inwards)
-                bot_line = offset_polyline(row_lines[ty + 1], half_clearance, constrain_axis=0)
-            
-            # Construct Polygon: Top (L->R) -> Right Edge -> Bottom (R->L) -> Left Edge
-            # Right edge connects Top[-1] to Bot[-1]
-            # Left edge connects Bot[0] to Top[0]
-            
-            poly_pts_row = np.vstack([
-                top_line,
-                bot_line[::-1]
-            ])
-            
-            row_tool = create_extruded_tool(poly_pts_row, z_min, z_max)
+            top_line = np.array([[0, 0], [ctx.eff_width_mm, 0]]) if ty == 0 else offset_polyline(row_lines[ty], -half_clearance, constrain_axis=0)
+            bot_line = (
+                np.array([[0, ctx.eff_height_mm], [ctx.eff_width_mm, ctx.eff_height_mm]])
+                if ty == ny - 1
+                else offset_polyline(row_lines[ty + 1], half_clearance, constrain_axis=0)
+            )
+            try:
+                row_tool = create_extruded_tool(np.vstack([top_line, bot_line[::-1]]), z_min, z_max)
+            except Exception as exc:
+                log.error("Failed to build row tool %d: %s", ty, exc)
+                continue
             if not row_tool.is_volume:
-                log.warning(f"Row tool {ty} is not a volume.")
-            
-            # Intersect full mesh with row tool
+                log.warning("Row tool %d is not a volume.", ty)
+
             try:
                 row_slice = full_mesh.intersection(row_tool, engine=boolean_engine)
-            except Exception as e:
-                log.error(f"Failed to cut row {ty}: {e}")
+            except Exception as exc:
+                log.error("Failed to cut row %d: %s", ty, exc)
                 continue
-                
             if row_slice.is_empty:
                 continue
 
             for tx in range(nx):
-                # Build Column Tool                # Left boundary
-                if tx == 0:
-                    left_line = np.array([[0, 0], [0, eff_height_mm]])
-                else:
-                    # Offset Right (right/inwards)
-                    left_line = offset_polyline(col_lines[tx], half_clearance, constrain_axis=1)
-                    
-                # Right boundary
-                if tx == nx - 1:
-                    right_line = np.array([[eff_width_mm, 0], [eff_width_mm, eff_height_mm]])
-                else:
-                    # Offset Left (left/inwards)
-                    right_line = offset_polyline(col_lines[tx + 1], -half_clearance, constrain_axis=1)
-                    
-                # Construct Polygon: Left (T->B) -> Bottom Edge -> Right (B->T) -> Top Edge
-                poly_pts_col = np.vstack([
-                    left_line,
-                    right_line[::-1]
-                ])
-                
-                col_tool = create_extruded_tool(poly_pts_col, z_min, z_max)
-                
+                left_line = np.array([[0, 0], [0, ctx.eff_height_mm]]) if tx == 0 else offset_polyline(col_lines[tx], half_clearance, constrain_axis=1)
+                right_line = (
+                    np.array([[ctx.eff_width_mm, 0], [ctx.eff_width_mm, ctx.eff_height_mm]])
+                    if tx == nx - 1
+                    else offset_polyline(col_lines[tx + 1], -half_clearance, constrain_axis=1)
+                )
+                try:
+                    col_tool = create_extruded_tool(np.vstack([left_line, right_line[::-1]]), z_min, z_max)
+                except Exception as exc:
+                    log.error("Failed to build col tool %d: %s", tx, exc)
+                    continue
                 try:
                     tile_mesh = row_slice.intersection(col_tool, engine=boolean_engine)
-                except Exception as e:
-                    log.error(f"Failed to cut tile {ty}_{tx}: {e}")
+                except Exception as exc:
+                    log.error("Failed to cut tile %d_%d: %s", ty, tx, exc)
                     continue
-                    
                 if tile_mesh.is_empty:
                     continue
-                    
                 out_path = out_dir / f"tile_{ty:02d}_{tx:02d}.stl"
                 tile_mesh.export(str(out_path))
-                log.info(f"Exported {out_path}")
+                log.info("Exported %s", out_path)
 
     log.info("Meshes written to: %s", str(out_dir))
+
+
+def main():
+    logging.basicConfig(level=logging.INFO)
+    log = logging.getLogger("depth_map")
+    args = parse_args()
+    if float(args.resampling_interval_mm) <= 0:
+        raise ValueError("--resamplin-interval-mm must be > 0")
+    ctx = load_raster_context(args, log)
+    plan = plan_tiling(ctx, args)
+    workers = resolve_worker_count(args.workers)
+    results = compute_corridor_lines_parallel(ctx, plan, args, workers, log)
+    results = refine_intersections_parallel(results, ctx, args, workers, log)
+    plot_corridor_lines(results, ctx, args)
+
+    if args.export_meshes:
+        export_tile_meshes(results, ctx, plan, args, log)
+        plt.close("all")
+        return
 
     plt.show()
 
