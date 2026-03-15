@@ -244,7 +244,17 @@ def stitch_tiles(z, tx_min, tx_max, ty_min, ty_max, args):
                 p.update(1)
     return big, (tx_min, ty_min)
 
-def build_elevation_map(lat_min, lat_max, lon_min, lon_max, zoom=12, cache_dir="./elevation_tiles", cache_array=False):
+def build_elevation_map(
+    lat_min,
+    lat_max,
+    lon_min,
+    lon_max,
+    zoom=12,
+    cache_dir="./elevation_tiles",
+    cache_array=False,
+    output_shape=None,
+    merge_resampling=Resampling.average,
+):
     """
     Download and assemble SRTM (NASADEM) elevation tiles for the bounding box.
     Tiles are cached in `cache_dir`. The assembled result is returned as a
@@ -254,12 +264,19 @@ def build_elevation_map(lat_min, lat_max, lon_min, lon_max, zoom=12, cache_dir="
     https://elevation-tiles-prod.s3.amazonaws.com
     """
     os.makedirs(cache_dir, exist_ok=True)
-    
-    array_cache_path = os.path.join(cache_dir, f"elevation_{lat_min}_{lat_max}_{lon_min}_{lon_max}.npy")
-    transform_cache_path = os.path.join(cache_dir, f"elevation_{lat_min}_{lat_max}_{lon_min}_{lon_max}_transform.pkl")
+
+    cache_suffix = ""
+    if output_shape is not None:
+        out_h = max(1, int(output_shape[0]))
+        out_w = max(1, int(output_shape[1]))
+        resamp_name = getattr(merge_resampling, "name", str(merge_resampling)).lower()
+        cache_suffix = f"_shape_{out_h}x{out_w}_resamp_{resamp_name}"
+
+    array_cache_path = os.path.join(cache_dir, f"elevation_{lat_min}_{lat_max}_{lon_min}_{lon_max}{cache_suffix}.npy")
+    transform_cache_path = os.path.join(cache_dir, f"elevation_{lat_min}_{lat_max}_{lon_min}_{lon_max}{cache_suffix}_transform.pkl")
     if cache_array and os.path.exists(array_cache_path):
         print(f"Loading cached elevation array from {array_cache_path} ...")
-        elev_array = np.load(array_cache_path)
+        elev_array = np.load(array_cache_path, mmap_mode="r")
         with open(transform_cache_path, "rb") as f:
             out_trans = pickle.load(f)
         return elev_array, out_trans
@@ -295,8 +312,26 @@ def build_elevation_map(lat_min, lat_max, lon_min, lon_max, zoom=12, cache_dir="
                 src_files_to_mosaic.append(src)
                 p.update(1)
 
-    # Merge multiple tiles into one elevation array
-    mosaic, out_trans = merge(src_files_to_mosaic)
+    # Merge multiple tiles into one elevation array. When output_shape is provided,
+    # cap the merged raster resolution before materializing it in memory.
+    merge_kwargs = {}
+    if output_shape is not None and src_files_to_mosaic:
+        out_h = max(1, int(output_shape[0]))
+        out_w = max(1, int(output_shape[1]))
+        lon_span = max(1e-12, float(lon_max - lon_min))
+        lat_span = max(1e-12, float(lat_max - lat_min))
+        native_res_x, native_res_y = src_files_to_mosaic[0].res
+        native_res_x = abs(float(native_res_x))
+        native_res_y = abs(float(native_res_y))
+        requested_res_x = lon_span / float(out_w)
+        requested_res_y = lat_span / float(out_h)
+        merge_kwargs["res"] = (
+            max(native_res_x, requested_res_x),
+            max(native_res_y, requested_res_y),
+        )
+        merge_kwargs["resampling"] = merge_resampling
+
+    mosaic, out_trans = merge(src_files_to_mosaic, **merge_kwargs)
     for src in src_files_to_mosaic:
         src.close()
     
@@ -304,7 +339,9 @@ def build_elevation_map(lat_min, lat_max, lon_min, lon_max, zoom=12, cache_dir="
         np.save(array_cache_path, mosaic[0])
         with open(transform_cache_path, "wb") as f:
             pickle.dump(out_trans, f)
-        
+        del mosaic
+        elev_array = np.load(array_cache_path, mmap_mode="r")
+        return elev_array, out_trans
 
     return mosaic[0], out_trans
 

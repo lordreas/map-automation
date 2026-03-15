@@ -106,18 +106,30 @@ class Timer:
 def parse_args():
     ap = argparse.ArgumentParser(description="Generate corridor masks for splitting an elevation map into printable tiles.")
     # bbox for build_elevation_map (same data source you already use)
-    ap.add_argument("--lat-min", default=42.75, type=float)
-    ap.add_argument("--lat-max", default=48.5, type=float)
-    ap.add_argument("--lon-min", default=4.5, type=float)
-    ap.add_argument("--lon-max", default=17, type=float)
+    ap.add_argument("--lat-min", default=43.5, type=float)
+    ap.add_argument("--lat-max", default=48.4, type=float)
+    ap.add_argument("--lon-min", default=4.9, type=float)
+    ap.add_argument("--lon-max", default=16.4, type=float)
 
     # all physical parameters in mm
-    ap.add_argument("--final-width-mm",   default=1500, type=float, help="Assembled final print width (mm)")
+    ap.add_argument("--final-width-mm",   default=2000, type=float, help="Assembled final print width (mm)")
     ap.add_argument("--final-height-mm",  default=1500,  type=float, help="Assembled final print height (mm)")
-    ap.add_argument("--bed-width-mm",     default=300,  type=float, help="Printer bed width (mm)")
-    ap.add_argument("--bed-height-mm",    default=300,  type=float, help="Printer bed height (mm)")
-    ap.add_argument("--overlap-width-mm", default=50,   type=float, help="Overlap width (mm)")
-    ap.add_argument("--elevation-interval-m", default=200.0, type=float, help="Contour interval in meters")
+    ap.add_argument("--bed-width-mm",     default=320,  type=float, help="Printer bed width (mm)")
+    ap.add_argument("--bed-height-mm",    default=320,  type=float, help="Printer bed height (mm)")
+    ap.add_argument("--overlap-width-mm", default=40,   type=float, help="Overlap width (mm)")
+    ap.add_argument("--elevation-interval-m", default=50.0, type=float, help="Contour interval in meters")
+    ap.add_argument(
+        "--elevation-fine-threshold-m",
+        default=300.0,
+        type=float,
+        help="Use the fine contour interval up to and including this elevation (m).",
+    )
+    ap.add_argument(
+        "--elevation-fine-interval-m",
+        default=10.0,
+        type=float,
+        help="Fine contour interval in meters used below the threshold.",
+    )
     ap.add_argument(
         "--reversal-split-mm",
         default=20.0,
@@ -138,9 +150,21 @@ def parse_args():
     )
     ap.add_argument(
         "--workers",
-        default=8,
+        default=12,
         type=int,
         help="Number of worker processes (0 => conservative default). One corridor is processed per worker.",
+    )
+    ap.add_argument(
+        "--mesh-export-workers",
+        default=1,
+        type=int,
+        help="Number of worker processes used for per-tile mesh export.",
+    )
+    ap.add_argument(
+        "--print-scale",
+        default=1.0,
+        type=float,
+        help="Uniform scale factor applied to nozzle-based resolution, fitting clearance, and final exported mesh vertices.",
     )
     ap.add_argument(
         "--export-meshes",
@@ -155,15 +179,21 @@ def parse_args():
     )
     ap.add_argument(
         "--bottom-thickness-mm",
-        default=1.5,
+        default=10,
         type=float,
         help="Extra solid thickness added below the minimum height (mm).",
     )
     ap.add_argument(
         "--desired-height-mm",
-        default=20.0,
+        default=50.0,
         type=float,
         help="Relief height above the bottom thickness (mm). Heights are normalized into [bottom_thickness_mm, bottom_thickness_mm + desired_height_mm] after the nonlinear mapping.",
+    )
+    ap.add_argument(
+        "--height-exponent",
+        default=0.7,
+        type=float,
+        help="Exponent applied to normalized heights during mesh generation. 1.0 keeps linear scaling.",
     )
     ap.add_argument(
         "--fitting-clearance",
@@ -246,20 +276,21 @@ def fit_mm_bbox_preserve_aspect_ratio(bbox_w_mm: float, bbox_h_mm: float, aspect
 
 
 def _uniform_filter_reflect(arr: np.ndarray, size: int) -> np.ndarray:
-    arr = np.asarray(arr, dtype=float)
+    arr = np.asarray(arr, dtype=np.float32)
     if size <= 1:
         return arr.copy()
     pad = int(size // 2)
     padded = np.pad(arr, ((pad, pad), (pad, pad)), mode="reflect")
-    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant", constant_values=0.0)
-    integral = np.cumsum(np.cumsum(integral, axis=0), axis=1)
+    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant", constant_values=np.float32(0.0))
+    integral = np.cumsum(np.cumsum(integral, axis=0, dtype=np.float32), axis=1, dtype=np.float32)
     sums = (
         integral[size:, size:]
         - integral[:-size, size:]
         - integral[size:, :-size]
         + integral[:-size, :-size]
     )
-    return sums / float(size * size)
+    sums *= np.float32(1.0 / float(size * size))
+    return sums.astype(np.float32, copy=False)
 
 
 def _pad_for_half_sampling(arr: np.ndarray, fill_edge: bool = True) -> np.ndarray:
@@ -278,51 +309,117 @@ def _masked_block_median(blocks: np.ndarray, valid_blocks: np.ndarray) -> np.nda
     flat = blocks.transpose(0, 2, 1, 3).reshape(h2, w2, 4)
     valid_flat = valid_blocks.transpose(0, 2, 1, 3).reshape(h2, w2, 4)
     counts = valid_flat.sum(axis=-1)
-    safe = np.where(valid_flat, flat, np.inf)
+    safe = np.where(valid_flat, flat, np.float32(np.inf))
     safe.sort(axis=-1)
     lo_idx = np.clip((counts - 1) // 2, 0, 3)[..., None]
     hi_idx = np.clip(counts // 2, 0, 3)[..., None]
     lo = np.take_along_axis(safe, lo_idx, axis=-1)[..., 0]
     hi = np.take_along_axis(safe, hi_idx, axis=-1)[..., 0]
-    med = 0.5 * (lo + hi)
+    med = np.float32(0.5) * (lo + hi)
     med[counts == 0] = np.nan
-    return med
+    return med.astype(np.float32, copy=False)
+
+
+def _clamp_nonnegative(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    neg_mask = np.isfinite(arr) & (arr < 0)
+    if not np.any(neg_mask):
+        return arr
+    if not arr.flags.writeable:
+        arr = np.array(arr, copy=True)
+    np.maximum(arr, 0, out=arr)
+    return arr
+
+
+def _build_contour_levels(
+    crop_min: float,
+    crop_max: float,
+    *,
+    fine_threshold_m: float,
+    fine_interval_m: float,
+    coarse_interval_m: float,
+) -> np.ndarray:
+    eps = 1e-9
+    levels: list[np.ndarray] = []
+
+    if crop_min <= fine_threshold_m + eps:
+        fine_stop = min(crop_max, fine_threshold_m)
+        fine_start = np.floor(crop_min / fine_interval_m) * fine_interval_m
+        fine_levels = np.arange(fine_start, fine_stop + fine_interval_m, fine_interval_m, dtype=float)
+        fine_levels = fine_levels[fine_levels <= fine_threshold_m + eps]
+        if fine_levels.size:
+            levels.append(fine_levels)
+
+    if crop_max > fine_threshold_m + eps:
+        coarse_start = np.ceil((fine_threshold_m + eps) / coarse_interval_m) * coarse_interval_m
+        coarse_start = max(coarse_start, np.floor(crop_min / coarse_interval_m) * coarse_interval_m)
+        coarse_levels = np.arange(coarse_start, crop_max + coarse_interval_m, coarse_interval_m, dtype=float)
+        coarse_levels = coarse_levels[coarse_levels > fine_threshold_m + eps]
+        if coarse_levels.size:
+            levels.append(coarse_levels)
+
+    if not levels:
+        return np.array([], dtype=float)
+    return np.unique(np.concatenate(levels))
+
+
+def _premerge_output_shape_for_nozzle(
+    eff_width_mm: float,
+    eff_height_mm: float,
+    nozzle_diameter_mm: float,
+    oversample_factor: float = 2.0,
+) -> tuple[int, int]:
+    target_mm_per_px = float(nozzle_diameter_mm) / 2.0
+    if target_mm_per_px <= 0.0:
+        raise ValueError("--nozzle-diameter-mm must be > 0")
+    premerge_mm_per_px = target_mm_per_px / max(float(oversample_factor), 1.0)
+    out_w = max(1, int(np.ceil(float(eff_width_mm) / premerge_mm_per_px)))
+    out_h = max(1, int(np.ceil(float(eff_height_mm) / premerge_mm_per_px)))
+    return out_h, out_w
 
 
 def downsample_minmax_half(arr: np.ndarray) -> np.ndarray:
-    arr = np.asarray(arr, dtype=np.float32)
+    arr = np.asarray(arr)
     valid = np.isfinite(arr)
     if not np.any(valid):
         new_h = max(1, (arr.shape[0] + 1) // 2)
         new_w = max(1, (arr.shape[1] + 1) // 2)
         return np.full((new_h, new_w), np.nan, dtype=np.float32)
 
-    arr_pad = _pad_for_half_sampling(arr, fill_edge=True)
+    arr_pad = np.asarray(_pad_for_half_sampling(arr, fill_edge=True), dtype=np.float32)
     valid_pad = _pad_for_half_sampling(valid, fill_edge=False)
+    del arr
 
-    global_fill = float(np.nanmedian(arr[valid]))
-    valid_f = valid_pad.astype(np.float32)
-    mean_vals = _uniform_filter_reflect(np.where(valid_pad, arr_pad, 0.0), size=25)
-    mean_mask = _uniform_filter_reflect(valid_f, size=25)
-    local_fill = np.divide(
-        mean_vals,
-        np.maximum(mean_mask, 1e-12),
-        out=np.full_like(mean_vals, global_fill, dtype=float),
-        where=mean_mask > 1e-12,
-    )
-    arr_filled = np.where(valid_pad, arr_pad, local_fill)
+    if not np.all(valid_pad):
+        global_fill = np.float32(np.nanmedian(arr_pad[valid_pad]))
+        valid_f = valid_pad.astype(np.float32, copy=False)
+        mean_vals = _uniform_filter_reflect(np.where(valid_pad, arr_pad, np.float32(0.0)), size=25)
+        mean_mask = _uniform_filter_reflect(valid_f, size=25)
+        np.divide(
+            mean_vals,
+            np.maximum(mean_mask, np.float32(1e-12)),
+            out=mean_vals,
+            where=mean_mask > np.float32(1e-12),
+        )
+        mean_vals[mean_mask <= np.float32(1e-12)] = global_fill
+        np.copyto(arr_pad, mean_vals, where=~valid_pad)
+        del mean_vals, mean_mask, valid_f
 
-    smooth = _uniform_filter_reflect(arr_filled, size=25)
-    lap_large = smooth - arr_filled
+    smooth = _uniform_filter_reflect(arr_pad, size=25)
+    lap_large = smooth - arr_pad
 
     h2 = arr_pad.shape[0] // 2
     w2 = arr_pad.shape[1] // 2
-    blocks = arr_filled.reshape(h2, 2, w2, 2)
+    blocks = arr_pad.reshape(h2, 2, w2, 2)
     valid_blocks = valid_pad.reshape(h2, 2, w2, 2)
     any_valid = valid_blocks.any(axis=(1, 3))
 
-    bmin = np.min(np.where(valid_blocks, blocks, np.inf), axis=(1, 3))
-    bmax = np.max(np.where(valid_blocks, blocks, -np.inf), axis=(1, 3))
+    if np.all(valid_blocks):
+        bmin = blocks.min(axis=(1, 3))
+        bmax = blocks.max(axis=(1, 3))
+    else:
+        bmin = np.min(np.where(valid_blocks, blocks, np.float32(np.inf)), axis=(1, 3))
+        bmax = np.max(np.where(valid_blocks, blocks, np.float32(-np.inf)), axis=(1, 3))
     bmed = _masked_block_median(blocks, valid_blocks)
     bmin[~any_valid] = np.nan
     bmax[~any_valid] = np.nan
@@ -1390,6 +1487,8 @@ def build_separating_line_for_corridor(
     eff_width_mm: float,
     eff_height_mm: float,
     interval_m: float,
+    fine_threshold_m: float,
+    fine_interval_m: float,
     reversal_split_mm: float,
     neighbor_radius_mm: float,
     resampling_interval_mm: float,
@@ -1409,12 +1508,15 @@ def build_separating_line_for_corridor(
     if not np.isfinite(crop_min) or not np.isfinite(crop_max):
         return None
 
-    levels = np.arange(
-        np.floor(crop_min / interval_m) * interval_m,
-        np.ceil(crop_max / interval_m) * interval_m + interval_m,
-        interval_m,
-        dtype=float,
+    levels = _build_contour_levels(
+        crop_min,
+        crop_max,
+        fine_threshold_m=float(fine_threshold_m),
+        fine_interval_m=float(fine_interval_m),
+        coarse_interval_m=float(interval_m),
     )
+    if levels.size == 0:
+        return None
 
     fill_val = crop_min - 1e6
     crop_filled = np.nan_to_num(crop, nan=fill_val, posinf=fill_val, neginf=fill_val)
@@ -1542,6 +1644,11 @@ def generate_full_mesh(
     mm_per_px_y: float,
     bottom_thickness_mm: float,
     desired_height_mm: float,
+    height_exponent: float = 1.0,
+    norm_h_min: Optional[float] = None,
+    norm_h_max: Optional[float] = None,
+    origin_x_mm: float = 0.0,
+    origin_y_mm: float = 0.0,
 ) -> trimesh.Trimesh:
     """
     Generate the full solid mesh for the elevation map in mm coordinates.
@@ -1552,14 +1659,21 @@ def generate_full_mesh(
     valid_mask = np.isfinite(elev_map)
     if not np.any(valid_mask):
         raise ValueError("Elevation map has no valid data")
-        
-    h_min = float(np.nanmin(elev_map[valid_mask]))
-    h_max = float(np.nanmax(elev_map[valid_mask]))
+
+    if norm_h_min is None or norm_h_max is None:
+        h_min = float(np.nanmin(elev_map[valid_mask]))
+        h_max = float(np.nanmax(elev_map[valid_mask]))
+    else:
+        h_min = float(norm_h_min)
+        h_max = float(norm_h_max)
     denom = max(1e-12, h_max - h_min)
     
     # Normalize to [0, 1]
     t = (elev_map - h_min) / denom
     t[~valid_mask] = 0.0 # Handle NaNs by setting to min height
+    np.clip(t, 0.0, 1.0, out=t)
+    if abs(float(height_exponent) - 1.0) > 1e-9:
+        np.power(t, float(height_exponent), out=t)
     
     # Map to mm Z
     z_values = bottom_thickness_mm + t * desired_height_mm
@@ -1569,8 +1683,8 @@ def generate_full_mesh(
     y_idx = np.arange(h)
     xv, yv = np.meshgrid(x_idx, y_idx)
     
-    x_mm = xv * mm_per_px_x
-    y_mm = yv * mm_per_px_y
+    x_mm = origin_x_mm + (xv * mm_per_px_x)
+    y_mm = origin_y_mm + (yv * mm_per_px_y)
     
     # Vertices (H*W, 3)
     vertices_top = np.column_stack((x_mm.ravel(), y_mm.ravel(), z_values.ravel()))
@@ -1807,6 +1921,28 @@ def save_graph_obj(
                 f.write(f"l {a + 1} {b + 1}\n")
 
 
+def _mesh_intersection(mesh: trimesh.Trimesh, tool: trimesh.Trimesh, preferred_engine: Optional[str] = "manifold"):
+    if preferred_engine:
+        try:
+            return mesh.intersection(tool, engine=preferred_engine)
+        except Exception:
+            pass
+    return mesh.intersection(tool)
+
+
+def _flip_points_across_x_axis(points_xy: np.ndarray, total_height_mm: float) -> np.ndarray:
+    flipped = np.asarray(points_xy, dtype=float).copy()
+    flipped[:, 1] = float(total_height_mm) - flipped[:, 1]
+    return flipped
+
+
+def _flip_mesh_across_x_axis(mesh: trimesh.Trimesh, total_height_mm: float) -> trimesh.Trimesh:
+    mesh = mesh.copy()
+    mesh.apply_scale([1.0, -1.0, 1.0])
+    mesh.apply_translation([0.0, float(total_height_mm), 0.0])
+    return mesh
+
+
 def _worker_build_corridor_line(args):
     """
     Multiprocessing worker: open elev_map via memmap and compute one corridor line.
@@ -1824,6 +1960,8 @@ def _worker_build_corridor_line(args):
         eff_width_mm,
         eff_height_mm,
         interval_m,
+        fine_threshold_m,
+        fine_interval_m,
         reversal_split_mm,
         neighbor_radius_mm,
         resampling_interval_mm,
@@ -1843,6 +1981,8 @@ def _worker_build_corridor_line(args):
         eff_width_mm=eff_width_mm,
         eff_height_mm=eff_height_mm,
         interval_m=interval_m,
+        fine_threshold_m=fine_threshold_m,
+        fine_interval_m=fine_interval_m,
         reversal_split_mm=reversal_split_mm,
         neighbor_radius_mm=neighbor_radius_mm,
         resampling_interval_mm=resampling_interval_mm,
@@ -1875,23 +2015,54 @@ def _corridor_key(corridor: dict) -> tuple[str, int]:
     return (str(corridor["kind"]), int(corridor["i"]))
 
 
-def load_raster_context(args, log: logging.Logger) -> RasterContext:
-    with Timer("load elevation_map", log):
-        elev_map, _elev_transform = build_elevation_map(
-            args.lat_min, args.lat_max, args.lon_min, args.lon_max, cache_array=True
-        )
-        if elev_map is None or elev_map.size == 0:
-            raise RuntimeError("build_elevation_map returned an empty array")
-        elev_map = np.asarray(elev_map, dtype=np.float32)
-        img_h, img_w = elev_map.shape
+def _effective_print_scale(args) -> float:
+    return float(args.print_scale)
 
+
+def _effective_nozzle_diameter_mm(args) -> float:
+    return float(args.nozzle_diameter_mm) / _effective_print_scale(args)
+
+
+def _effective_fitting_clearance_mm(args) -> float:
+    return float(args.fitting_clearance) / _effective_print_scale(args)
+
+
+def load_raster_context(args, log: logging.Logger) -> RasterContext:
     local_crs = choose_local_crs(args.lat_min, args.lat_max, args.lon_min, args.lon_max)
     _, _, _, _, bbox_w_m, bbox_h_m = project_bbox_to_local_m(
         args.lat_min, args.lat_max, args.lon_min, args.lon_max, local_crs
     )
-    aspect_m = bbox_w_m / float(bbox_h_m) if bbox_h_m else (img_w / float(img_h))
+    aspect_m = bbox_w_m / float(bbox_h_m) if bbox_h_m else 1.0
     eff_width_mm, eff_height_mm = fit_mm_bbox_preserve_aspect_ratio(
         args.final_width_mm, args.final_height_mm, aspect_m
+    )
+    premerge_shape = _premerge_output_shape_for_nozzle(
+        eff_width_mm=float(eff_width_mm),
+        eff_height_mm=float(eff_height_mm),
+        nozzle_diameter_mm=_effective_nozzle_diameter_mm(args),
+        oversample_factor=2.0,
+    )
+
+    with Timer("load elevation_map", log):
+        elev_map, _elev_transform = build_elevation_map(
+            args.lat_min,
+            args.lat_max,
+            args.lon_min,
+            args.lon_max,
+            cache_array=True,
+            output_shape=premerge_shape,
+        )
+        if elev_map is None or elev_map.size == 0:
+            raise RuntimeError("build_elevation_map returned an empty array")
+        elev_map = _clamp_nonnegative(elev_map)
+        img_h, img_w = elev_map.shape
+
+    log.info(
+        "premerge raster target: %dx%d -> loaded %dx%d",
+        int(premerge_shape[0]),
+        int(premerge_shape[1]),
+        int(img_h),
+        int(img_w),
     )
 
     with Timer("downsample elevation_map", log):
@@ -1899,15 +2070,16 @@ def load_raster_context(args, log: logging.Logger) -> RasterContext:
             elev_map,
             eff_width_mm=float(eff_width_mm),
             eff_height_mm=float(eff_height_mm),
-            nozzle_diameter_mm=float(args.nozzle_diameter_mm),
+            nozzle_diameter_mm=_effective_nozzle_diameter_mm(args),
         )
+    elev_map = _clamp_nonnegative(elev_map)
     img_h, img_w = elev_map.shape
     log.info(
         "downsampled raster: %dx%d (steps=%d, nozzle=%.3fmm, mm/px=%.4f x %.4f)",
         img_h,
         img_w,
         downsample_steps,
-        float(args.nozzle_diameter_mm),
+        _effective_nozzle_diameter_mm(args),
         float(eff_width_mm) / float(max(1, img_w)),
         float(eff_height_mm) / float(max(1, img_h)),
     )
@@ -1971,8 +2143,10 @@ def compute_corridor_lines_parallel(
     interval = float(args.elevation_interval_m)
     if interval <= 0:
         raise ValueError("--elevation-interval-m must be > 0")
+    if float(args.elevation_fine_interval_m) <= 0:
+        raise ValueError("--elevation-fine-interval-m must be > 0")
     if float(args.resampling_interval_mm) <= 0:
-        raise ValueError("--resamplin-interval-mm must be > 0")
+        raise ValueError("--resampling-interval-mm must be > 0")
 
     tmp_dir = Path(tempfile.gettempdir())
     mmap_path = str(tmp_dir / f"depth_map_elev_{os.getpid()}.mmap")
@@ -1997,6 +2171,8 @@ def compute_corridor_lines_parallel(
                 float(ctx.eff_width_mm),
                 float(ctx.eff_height_mm),
                 float(interval),
+                float(args.elevation_fine_threshold_m),
+                float(args.elevation_fine_interval_m),
                 float(args.reversal_split_mm),
                 float(args.neighbor_radius_mm),
                 float(args.resampling_interval_mm),
@@ -2174,11 +2350,160 @@ def _cycle_edge_keys(adj: dict[int, list[tuple[int, float]]]) -> set[tuple[int, 
     return cycle_edges
 
 
-def _remove_edges_by_key(adj: dict[int, list[tuple[int, float]]], edge_keys: set[tuple[int, int]]):
+def _node_set_from_edge_keys(edge_keys: set[tuple[int, int]]) -> set[int]:
+    nodes: set[int] = set()
+    for u, v in edge_keys:
+        nodes.add(int(u))
+        nodes.add(int(v))
+    return nodes
+
+
+def _build_adj_from_edge_keys(
+    edge_keys: set[tuple[int, int]],
+    edge_lengths: dict[tuple[int, int], float],
+) -> dict[int, list[tuple[int, float]]]:
+    adj: dict[int, list[tuple[int, float]]] = {}
+    for u, v in edge_keys:
+        w = float(edge_lengths[_edge_key(u, v)])
+        adj.setdefault(int(u), []).append((int(v), w))
+        adj.setdefault(int(v), []).append((int(u), w))
+    return adj
+
+
+def _cycle_components_from_edge_keys(
+    edge_keys: set[tuple[int, int]],
+    edge_lengths: dict[tuple[int, int], float],
+) -> list[tuple[set[int], set[tuple[int, int]]]]:
     if not edge_keys:
-        return
-    for u in list(adj.keys()):
-        adj[u] = [(v, w) for (v, w) in adj[u] if _edge_key(u, v) not in edge_keys]
+        return []
+    adj = _build_adj_from_edge_keys(edge_keys, edge_lengths)
+    cycle_edges = _cycle_edge_keys(adj)
+    if not cycle_edges:
+        return []
+    cycle_adj = _build_adj_from_edge_keys(cycle_edges, edge_lengths)
+    comps: list[tuple[set[int], set[tuple[int, int]]]] = []
+    for comp_nodes_list in connected_components(cycle_adj):
+        comp_nodes = {int(u) for u in comp_nodes_list}
+        comp_edges = {edge for edge in cycle_edges if int(edge[0]) in comp_nodes and int(edge[1]) in comp_nodes}
+        if comp_edges:
+            comps.append((comp_nodes, comp_edges))
+    return comps
+
+
+def _build_quadrant_replacement_paths_from_graph(
+    coords: list[np.ndarray],
+    adj: dict[int, list[tuple[int, float]]],
+    key_to_id: dict[tuple[int, int], int],
+    vertical_section: np.ndarray,
+    horizontal_section: np.ndarray,
+    *,
+    ctx,
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    top_pt = vertical_section[int(np.argmin(vertical_section[:, 0]))]
+    bottom_pt = vertical_section[int(np.argmax(vertical_section[:, 0]))]
+    left_pt = horizontal_section[int(np.argmin(horizontal_section[:, 1]))]
+    right_pt = horizontal_section[int(np.argmax(horizontal_section[:, 1]))]
+
+    top_id = _node_id_for_point(key_to_id, top_pt)
+    bottom_id = _node_id_for_point(key_to_id, bottom_pt)
+    left_id = _node_id_for_point(key_to_id, left_pt)
+    right_id = _node_id_for_point(key_to_id, right_pt)
+    if None in (top_id, bottom_id, left_id, right_id):
+        return None
+
+    quadrant_specs = [
+        ("tr", int(top_id), int(right_id)),
+        ("rb", int(right_id), int(bottom_id)),
+        ("bl", int(bottom_id), int(left_id)),
+        ("lt", int(left_id), int(top_id)),
+    ]
+    quadrant_polylines: dict[str, np.ndarray] = {}
+    for label, start_id, end_id in quadrant_specs:
+        path_ids = dijkstra_path(adj, start_id, end_id)
+        if not path_ids:
+            return None
+        quadrant_polylines[label] = np.array([coords[n] for n in path_ids], dtype=float)
+
+    border_coords, border_adj, border_key_to_id = build_graph_from_polylines(
+        [quadrant_polylines[label] for label, _start_id, _end_id in quadrant_specs],
+        mppx=ctx.mppx,
+        mppy=ctx.mppy,
+        quantize_q=2.0,
+        resample_step_m=0.0,
+    )
+    if not border_coords:
+        return None
+
+    top_border_id = _node_id_for_point(border_key_to_id, top_pt)
+    bottom_border_id = _node_id_for_point(border_key_to_id, bottom_pt)
+    left_border_id = _node_id_for_point(border_key_to_id, left_pt)
+    right_border_id = _node_id_for_point(border_key_to_id, right_pt)
+    if None in (top_border_id, bottom_border_id, left_border_id, right_border_id):
+        return None
+
+    quadrant_edge_keys: dict[str, set[tuple[int, int]]] = {}
+    for label, polyline_rc in quadrant_polylines.items():
+        path_ids = _polyline_node_ids(border_key_to_id, polyline_rc, quantize_q=2.0)
+        if len(path_ids) < 2:
+            return None
+        quadrant_edge_keys[label] = _path_edge_keys(path_ids)
+
+    edge_lengths = _edge_length_map(border_adj)
+    protected_nodes = {int(top_border_id), int(bottom_border_id), int(left_border_id), int(right_border_id)}
+
+    while True:
+        combined_edge_keys: set[tuple[int, int]] = set()
+        for edge_keys in quadrant_edge_keys.values():
+            combined_edge_keys.update(edge_keys)
+
+        loop_components = [
+            (loop_nodes, loop_edges)
+            for (loop_nodes, loop_edges) in _cycle_components_from_edge_keys(combined_edge_keys, edge_lengths)
+            if not (loop_nodes & protected_nodes)
+        ]
+        if not loop_components:
+            break
+
+        progress = False
+        for loop_nodes, loop_edges in loop_components:
+            best_label = None
+            best_shared_vertices = -1
+            best_shared_len = -1.0
+            for label, path_edges in quadrant_edge_keys.items():
+                shared_edges = loop_edges & path_edges
+                shared_vertices = len(loop_nodes & _node_set_from_edge_keys(path_edges))
+                shared_len = float(sum(edge_lengths.get(edge, 0.0) for edge in shared_edges))
+                if shared_vertices > best_shared_vertices or (
+                    shared_vertices == best_shared_vertices and shared_len > best_shared_len
+                ):
+                    best_label = label
+                    best_shared_vertices = shared_vertices
+                    best_shared_len = shared_len
+
+            if best_label is None or best_shared_vertices <= 0:
+                return None
+
+            quadrant_edge_keys[best_label] = quadrant_edge_keys[best_label] ^ loop_edges
+            progress = True
+
+        if not progress:
+            return None
+
+    final_edge_keys: set[tuple[int, int]] = set()
+    for edge_keys in quadrant_edge_keys.values():
+        final_edge_keys.update(edge_keys)
+    final_adj = _build_adj_from_edge_keys(final_edge_keys, edge_lengths)
+    if any(node_id not in final_adj for node_id in protected_nodes):
+        return None
+
+    vertical_path_ids = dijkstra_path(final_adj, int(top_border_id), int(bottom_border_id))
+    horizontal_path_ids = dijkstra_path(final_adj, int(left_border_id), int(right_border_id))
+    if not vertical_path_ids or not horizontal_path_ids:
+        return None
+
+    vertical_path = np.array([border_coords[n] for n in vertical_path_ids], dtype=float)
+    horizontal_path = np.array([border_coords[n] for n in horizontal_path_ids], dtype=float)
+    return vertical_path, horizontal_path
 
 
 def _build_local_replacement_paths(
@@ -2231,84 +2556,15 @@ def _build_local_replacement_paths(
             mm_per_px_y=ctx.mm_per_px_y,
         )
 
-    top_pt = vertical_section[int(np.argmin(vertical_section[:, 0]))]
-    bottom_pt = vertical_section[int(np.argmax(vertical_section[:, 0]))]
-    left_pt = horizontal_section[int(np.argmin(horizontal_section[:, 1]))]
-    right_pt = horizontal_section[int(np.argmax(horizontal_section[:, 1]))]
-
-    top_id = _node_id_for_point(key_to_id, top_pt)
-    bottom_id = _node_id_for_point(key_to_id, bottom_pt)
-    left_id = _node_id_for_point(key_to_id, left_pt)
-    right_id = _node_id_for_point(key_to_id, right_pt)
-    if None in (top_id, bottom_id, left_id, right_id):
-        return None
-
-    quadrant_specs = [
-        ("tr", int(top_id), int(right_id)),
-        ("rb", int(right_id), int(bottom_id)),
-        ("bl", int(bottom_id), int(left_id)),
-        ("lt", int(left_id), int(top_id)),
-    ]
-    quadrant_polylines: dict[str, np.ndarray] = {}
-    for label, start_id, end_id in quadrant_specs:
-        path_ids = dijkstra_path(adj, start_id, end_id)
-        if not path_ids:
-            return None
-        quadrant_polylines[label] = np.array([coords[n] for n in path_ids], dtype=float)
-
-    border_coords, border_adj, border_key_to_id = build_graph_from_polylines(
-        [quadrant_polylines[label] for label, _start_id, _end_id in quadrant_specs],
-        mppx=ctx.mppx,
-        mppy=ctx.mppy,
-        quantize_q=2.0,
-        resample_step_m=0.0,
+    quadrant_paths = _build_quadrant_replacement_paths_from_graph(
+        coords,
+        adj,
+        key_to_id,
+        vertical_section,
+        horizontal_section,
+        ctx=ctx,
     )
-    if not border_coords:
-        return None
-
-    top_border_id = _node_id_for_point(border_key_to_id, top_pt)
-    bottom_border_id = _node_id_for_point(border_key_to_id, bottom_pt)
-    left_border_id = _node_id_for_point(border_key_to_id, left_pt)
-    right_border_id = _node_id_for_point(border_key_to_id, right_pt)
-    if None in (top_border_id, bottom_border_id, left_border_id, right_border_id):
-        return None
-
-    quadrant_edge_keys: dict[str, set[tuple[int, int]]] = {}
-    for label, polyline_rc in quadrant_polylines.items():
-        path_ids = _polyline_node_ids(border_key_to_id, polyline_rc, quantize_q=2.0)
-        if len(path_ids) < 2:
-            return None
-        quadrant_edge_keys[label] = _path_edge_keys(path_ids)
-
-    edge_lengths = _edge_length_map(border_adj)
-    while True:
-        cycle_edges = _cycle_edge_keys(border_adj)
-        if not cycle_edges:
-            break
-
-        best_label = None
-        best_shared_edges: set[tuple[int, int]] = set()
-        best_shared_len = 0.0
-        for label, path_edges in quadrant_edge_keys.items():
-            shared_edges = cycle_edges & path_edges
-            shared_len = float(sum(edge_lengths.get(edge, 0.0) for edge in shared_edges))
-            if shared_len > best_shared_len:
-                best_shared_len = shared_len
-                best_shared_edges = shared_edges
-                best_label = label
-
-        if best_label is None or not best_shared_edges:
-            break
-        _remove_edges_by_key(border_adj, best_shared_edges)
-
-    vertical_path_ids = dijkstra_path(border_adj, int(top_border_id), int(bottom_border_id))
-    horizontal_path_ids = dijkstra_path(border_adj, int(left_border_id), int(right_border_id))
-    if not vertical_path_ids or not horizontal_path_ids:
-        return None
-
-    vertical_path = np.array([border_coords[n] for n in vertical_path_ids], dtype=float)
-    horizontal_path = np.array([border_coords[n] for n in horizontal_path_ids], dtype=float)
-    return vertical_path, horizontal_path
+    return quadrant_paths
 
 
 def _intersection_replacement_task(task: dict) -> Optional[dict]:
@@ -2506,6 +2762,120 @@ def plot_corridor_lines(results: list[dict], ctx: RasterContext, args):
     plt.tight_layout()
 
 
+def _tile_bounds_mm(
+    ctx: RasterContext,
+    args,
+    col_starts_mm: list[float],
+    row_starts_mm: list[float],
+    tx: int,
+    ty: int,
+) -> tuple[float, float, float, float]:
+    x0_mm = float(col_starts_mm[tx])
+    y0_mm = float(row_starts_mm[ty])
+    x1_mm = min(float(ctx.eff_width_mm), x0_mm + float(args.bed_width_mm))
+    y1_mm = min(float(ctx.eff_height_mm), y0_mm + float(args.bed_height_mm))
+    return x0_mm, x1_mm, y0_mm, y1_mm
+
+
+def _tile_crop_bounds_px(
+    ctx: RasterContext,
+    args,
+    tile_bounds_mm: tuple[float, float, float, float],
+) -> tuple[int, int, int, int]:
+    x0_mm, x1_mm, y0_mm, y1_mm = tile_bounds_mm
+    pad_mm = float(args.overlap_width_mm) + max(
+        float(args.resampling_interval_mm),
+        _effective_fitting_clearance_mm(args),
+        1.0,
+    )
+    crop_x0_mm = max(0.0, x0_mm - pad_mm)
+    crop_x1_mm = min(float(ctx.eff_width_mm), x1_mm + pad_mm)
+    crop_y0_mm = max(0.0, y0_mm - pad_mm)
+    crop_y1_mm = min(float(ctx.eff_height_mm), y1_mm + pad_mm)
+
+    x0_px = max(0, int(np.floor(crop_x0_mm / float(ctx.mm_per_px_x))))
+    x1_px = min(int(ctx.img_w), int(np.ceil(crop_x1_mm / float(ctx.mm_per_px_x))) + 1)
+    y0_px = max(0, int(np.floor(crop_y0_mm / float(ctx.mm_per_px_y))))
+    y1_px = min(int(ctx.img_h), int(np.ceil(crop_y1_mm / float(ctx.mm_per_px_y))) + 1)
+    return x0_px, x1_px, y0_px, y1_px
+
+
+def _worker_export_tile_mesh(args):
+    (
+        tx,
+        ty,
+        out_path,
+        mmap_path,
+        shape,
+        dtype_str,
+        crop_x0_px,
+        crop_x1_px,
+        crop_y0_px,
+        crop_y1_px,
+        mm_per_px_x,
+        mm_per_px_y,
+        bottom_thickness_mm,
+        desired_height_mm,
+        height_exponent,
+        norm_h_min,
+        norm_h_max,
+        total_height_mm,
+        print_scale,
+        z_min,
+        z_max,
+        top_line,
+        bot_line,
+        left_line,
+        right_line,
+    ) = args
+
+    t0 = time.perf_counter()
+    elev_map = np.memmap(mmap_path, dtype=np.dtype(dtype_str), mode="r", shape=shape)
+    crop = elev_map[crop_y0_px:crop_y1_px, crop_x0_px:crop_x1_px]
+    if crop.shape[0] < 2 or crop.shape[1] < 2:
+        return {"status": "error", "tx": tx, "ty": ty, "error": f"crop too small: {crop.shape}"}
+
+    try:
+        local_mesh = generate_full_mesh(
+            crop,
+            mm_per_px_x=float(mm_per_px_x),
+            mm_per_px_y=float(mm_per_px_y),
+            bottom_thickness_mm=float(bottom_thickness_mm),
+            desired_height_mm=float(desired_height_mm),
+            height_exponent=float(height_exponent),
+            norm_h_min=float(norm_h_min),
+            norm_h_max=float(norm_h_max),
+            origin_x_mm=float(crop_x0_px) * float(mm_per_px_x),
+            origin_y_mm=float(crop_y0_px) * float(mm_per_px_y),
+        )
+        row_tool = create_extruded_tool(np.vstack([top_line, bot_line[::-1]]), float(z_min), float(z_max))
+        row_slice = _mesh_intersection(local_mesh, row_tool, preferred_engine="manifold")
+        if row_slice.is_empty:
+            return {"status": "empty", "tx": tx, "ty": ty}
+
+        col_tool = create_extruded_tool(np.vstack([left_line, right_line[::-1]]), float(z_min), float(z_max))
+        tile_mesh = _mesh_intersection(row_slice, col_tool, preferred_engine="manifold")
+        if tile_mesh.is_empty:
+            return {"status": "empty", "tx": tx, "ty": ty}
+
+        tile_mesh = _flip_mesh_across_x_axis(tile_mesh, float(total_height_mm))
+        if abs(float(print_scale) - 1.0) > 1e-9:
+            tile_mesh.apply_scale([float(print_scale), float(print_scale), float(print_scale)])
+        tile_mesh.export(str(out_path))
+        return {
+            "status": "ok",
+            "tx": tx,
+            "ty": ty,
+            "path": str(out_path),
+            "t_sec": float(time.perf_counter() - t0),
+        }
+    except Exception as exc:
+        return {"status": "error", "tx": tx, "ty": ty, "error": str(exc)}
+    finally:
+        del crop
+        del elev_map
+
+
 def export_tile_meshes(
     results: list[dict],
     ctx: RasterContext,
@@ -2519,21 +2889,10 @@ def export_tile_meshes(
     lines_mm = []
     for result in results:
         pts_mm = np.column_stack((result["cols_full"] * ctx.mm_per_px_x, result["rows_full"] * ctx.mm_per_px_y))
-        lines_mm.append(pts_mm)
+        lines_mm.append(_flip_points_across_x_axis(pts_mm, float(ctx.eff_height_mm)))
     z_lines = args.bottom_thickness_mm + args.desired_height_mm + 0.5
     save_lines_obj(str(out_dir / "corridor_lines.obj"), lines_mm, z=z_lines)
     log.info("Exported corridor_lines.obj")
-
-    with Timer("generate full mesh", log):
-        full_mesh = generate_full_mesh(
-            ctx.elev_map,
-            mm_per_px_x=ctx.mm_per_px_x,
-            mm_per_px_y=ctx.mm_per_px_y,
-            bottom_thickness_mm=args.bottom_thickness_mm,
-            desired_height_mm=args.desired_height_mm,
-        )
-        if not full_mesh.is_volume:
-            log.warning("Full mesh is not a watertight volume! Boolean operations may fail.")
 
     col_lines: dict[int, np.ndarray] = {}
     row_lines: dict[int, np.ndarray] = {}
@@ -2549,59 +2908,177 @@ def export_tile_meshes(
     z_max = args.bottom_thickness_mm + args.desired_height_mm + 1.0
     nx = len(plan.col_starts_px)
     ny = len(plan.row_starts_px)
-    boolean_engine = None
-    try:
-        boolean_engine = "manifold"
-    except Exception:
-        pass
+    global_h_min = float(np.nanmin(ctx.elev_map))
+    global_h_max = float(np.nanmax(ctx.elev_map))
+    if not np.isfinite(global_h_min) or not np.isfinite(global_h_max):
+        raise RuntimeError("Cannot export meshes because the global elevation range is invalid")
+    col_starts_mm = plan_tile_starts_mm(ctx.eff_width_mm, args.bed_width_mm, args.overlap_width_mm)
+    row_starts_mm = plan_tile_starts_mm(ctx.eff_height_mm, args.bed_height_mm, args.overlap_width_mm)
+    half_clearance = _effective_fitting_clearance_mm(args) / 2.0
 
-    half_clearance = args.fitting_clearance / 2.0
-    with Timer("process tiles (boolean)", log):
-        for ty in range(ny):
-            top_line = np.array([[0, 0], [ctx.eff_width_mm, 0]]) if ty == 0 else offset_polyline(row_lines[ty], -half_clearance, constrain_axis=0)
-            bot_line = (
-                np.array([[0, ctx.eff_height_mm], [ctx.eff_width_mm, ctx.eff_height_mm]])
-                if ty == ny - 1
-                else offset_polyline(row_lines[ty + 1], half_clearance, constrain_axis=0)
+    missing_cols = [idx for idx in range(1, nx) if idx not in col_lines]
+    missing_rows = [idx for idx in range(1, ny) if idx not in row_lines]
+    if missing_cols or missing_rows:
+        raise RuntimeError(
+            f"Cannot export meshes because corridor lines are missing: cols={missing_cols}, rows={missing_rows}"
+        )
+
+    tasks = []
+    for ty in range(ny):
+        top_line = (
+            np.array([[0.0, 0.0], [float(ctx.eff_width_mm), 0.0]], dtype=float)
+            if ty == 0
+            else offset_polyline(row_lines[ty], -half_clearance, constrain_axis=0)
+        )
+        bot_line = (
+            np.array([[0.0, float(ctx.eff_height_mm)], [float(ctx.eff_width_mm), float(ctx.eff_height_mm)]], dtype=float)
+            if ty == ny - 1
+            else offset_polyline(row_lines[ty + 1], half_clearance, constrain_axis=0)
+        )
+        for tx in range(nx):
+            left_line = (
+                np.array([[0.0, 0.0], [0.0, float(ctx.eff_height_mm)]], dtype=float)
+                if tx == 0
+                else offset_polyline(col_lines[tx], half_clearance, constrain_axis=1)
             )
-            try:
-                row_tool = create_extruded_tool(np.vstack([top_line, bot_line[::-1]]), z_min, z_max)
-            except Exception as exc:
-                log.error("Failed to build row tool %d: %s", ty, exc)
-                continue
-            if not row_tool.is_volume:
-                log.warning("Row tool %d is not a volume.", ty)
-
-            try:
-                row_slice = full_mesh.intersection(row_tool, engine=boolean_engine)
-            except Exception as exc:
-                log.error("Failed to cut row %d: %s", ty, exc)
-                continue
-            if row_slice.is_empty:
-                continue
-
-            for tx in range(nx):
-                left_line = np.array([[0, 0], [0, ctx.eff_height_mm]]) if tx == 0 else offset_polyline(col_lines[tx], half_clearance, constrain_axis=1)
-                right_line = (
-                    np.array([[ctx.eff_width_mm, 0], [ctx.eff_width_mm, ctx.eff_height_mm]])
-                    if tx == nx - 1
-                    else offset_polyline(col_lines[tx + 1], -half_clearance, constrain_axis=1)
+            right_line = (
+                np.array([[float(ctx.eff_width_mm), 0.0], [float(ctx.eff_width_mm), float(ctx.eff_height_mm)]], dtype=float)
+                if tx == nx - 1
+                else offset_polyline(col_lines[tx + 1], -half_clearance, constrain_axis=1)
+            )
+            tile_bounds_mm = _tile_bounds_mm(ctx, args, col_starts_mm, row_starts_mm, tx, ty)
+            crop_x0_px, crop_x1_px, crop_y0_px, crop_y1_px = _tile_crop_bounds_px(ctx, args, tile_bounds_mm)
+            out_path = out_dir / f"tile_{ty:02d}_{tx:02d}.stl"
+            tasks.append(
+                (
+                    tx,
+                    ty,
+                    str(out_path),
+                    None,
+                    None,
+                    str(ctx.elev_map.dtype),
+                    crop_x0_px,
+                    crop_x1_px,
+                    crop_y0_px,
+                    crop_y1_px,
+                    float(ctx.mm_per_px_x),
+                    float(ctx.mm_per_px_y),
+                    float(args.bottom_thickness_mm),
+                    float(args.desired_height_mm),
+                    float(args.height_exponent),
+                    float(global_h_min),
+                    float(global_h_max),
+                    float(ctx.eff_height_mm),
+                    _effective_print_scale(args),
+                    float(z_min),
+                    float(z_max),
+                    np.asarray(top_line, dtype=np.float32),
+                    np.asarray(bot_line, dtype=np.float32),
+                    np.asarray(left_line, dtype=np.float32),
+                    np.asarray(right_line, dtype=np.float32),
                 )
-                try:
-                    col_tool = create_extruded_tool(np.vstack([left_line, right_line[::-1]]), z_min, z_max)
-                except Exception as exc:
-                    log.error("Failed to build col tool %d: %s", tx, exc)
-                    continue
-                try:
-                    tile_mesh = row_slice.intersection(col_tool, engine=boolean_engine)
-                except Exception as exc:
-                    log.error("Failed to cut tile %d_%d: %s", ty, tx, exc)
-                    continue
-                if tile_mesh.is_empty:
-                    continue
-                out_path = out_dir / f"tile_{ty:02d}_{tx:02d}.stl"
-                tile_mesh.export(str(out_path))
-                log.info("Exported %s", out_path)
+            )
+
+    export_workers = max(1, min(int(args.mesh_export_workers), len(tasks)))
+    log.info("export tiles via local crops: %d tasks, workers=%d", len(tasks), export_workers)
+    if not tasks:
+        log.warning("No tile export tasks were generated")
+        return
+
+    tmp_dir = Path(tempfile.gettempdir())
+    mmap_path = str(tmp_dir / f"depth_map_mesh_{os.getpid()}.mmap")
+    with Timer("write export memmap", log):
+        mm = np.memmap(mmap_path, dtype=ctx.elev_map.dtype, mode="w+", shape=ctx.elev_map.shape)
+        mm[:] = ctx.elev_map
+        mm.flush()
+        del mm
+
+    try:
+        job_args = [
+            (
+                tx,
+                ty,
+                out_path,
+                mmap_path,
+                ctx.elev_map.shape,
+                str(ctx.elev_map.dtype),
+                crop_x0_px,
+                crop_x1_px,
+                crop_y0_px,
+                crop_y1_px,
+                mm_per_px_x,
+                mm_per_px_y,
+                bottom_thickness_mm,
+                desired_height_mm,
+                height_exponent,
+                norm_h_min,
+                norm_h_max,
+                total_height_mm,
+                print_scale,
+                z_min,
+                z_max,
+                top_line,
+                bot_line,
+                left_line,
+                right_line,
+            )
+            for (
+                tx,
+                ty,
+                out_path,
+                _mmap_path,
+                _shape,
+                _dtype_str,
+                crop_x0_px,
+                crop_x1_px,
+                crop_y0_px,
+                crop_y1_px,
+                mm_per_px_x,
+                mm_per_px_y,
+                bottom_thickness_mm,
+                desired_height_mm,
+                height_exponent,
+                norm_h_min,
+                norm_h_max,
+                total_height_mm,
+                print_scale,
+                z_min,
+                z_max,
+                top_line,
+                bot_line,
+                left_line,
+                right_line,
+            ) in tasks
+        ]
+
+        with Timer("process tiles (boolean, multiprocessing)", log):
+            ctx_mp = get_context("spawn")
+            with ctx_mp.Pool(processes=export_workers) as pool:
+                it = pool.imap_unordered(_worker_export_tile_mesh, job_args, chunksize=1)
+                for result in tqdm(it, total=len(job_args), desc="Export tiles", unit="tile"):
+                    status = str(result.get("status", "error"))
+                    if status == "ok":
+                        log.info(
+                            "Exported %s (tile %02d_%02d, %.2fs)",
+                            result["path"],
+                            int(result["ty"]),
+                            int(result["tx"]),
+                            float(result["t_sec"]),
+                        )
+                    elif status == "empty":
+                        log.warning("Tile %02d_%02d produced an empty mesh", int(result["ty"]), int(result["tx"]))
+                    else:
+                        log.error(
+                            "Failed to export tile %02d_%02d: %s",
+                            int(result["ty"]),
+                            int(result["tx"]),
+                            result.get("error", "unknown error"),
+                        )
+    finally:
+        try:
+            os.remove(mmap_path)
+        except OSError:
+            pass
 
     log.info("Meshes written to: %s", str(out_dir))
 
@@ -2611,7 +3088,13 @@ def main():
     log = logging.getLogger("depth_map")
     args = parse_args()
     if float(args.resampling_interval_mm) <= 0:
-        raise ValueError("--resamplin-interval-mm must be > 0")
+        raise ValueError("--resampling-interval-mm must be > 0")
+    if float(args.print_scale) <= 0:
+        raise ValueError("--print-scale must be > 0")
+    if float(args.height_exponent) <= 0:
+        raise ValueError("--height-exponent must be > 0")
+    if int(args.mesh_export_workers) <= 0:
+        raise ValueError("--mesh-export-workers must be > 0")
     ctx = load_raster_context(args, log)
     plan = plan_tiling(ctx, args)
     workers = resolve_worker_count(args.workers)
