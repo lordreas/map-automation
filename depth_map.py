@@ -1653,7 +1653,16 @@ def generate_full_mesh(
     origin_y_mm: float = 0.0,
 ) -> trimesh.Trimesh:
     """
-    Generate the full solid mesh for the elevation map in mm coordinates.
+    Inputs:
+    - `elev_map`: 2D elevation raster.
+    - `mm_per_px_x`, `mm_per_px_y`: physical XY spacing per raster sample.
+    - `bottom_thickness_mm`, `desired_height_mm`: relief thickness controls.
+    - `height_exponent`: optional nonlinear scaling on normalized heights.
+    - `norm_h_min`, `norm_h_max`: optional global normalization range.
+    - `origin_x_mm`, `origin_y_mm`: XY offset for cropped local meshes.
+
+    Outputs:
+    - Returns one watertight terrain solid mesh in mm coordinates.
     """
     h, w = elev_map.shape
     
@@ -1798,7 +1807,12 @@ def create_extruded_tool(
     z_max: float
 ) -> trimesh.Trimesh:
     """
-    Create a prism tool from a 2D boundary polygon (N, 2).
+    Inputs:
+    - `boundary_points`: 2D polygon boundary in XY mesh coordinates.
+    - `z_min`, `z_max`: vertical extent of the cutting prism.
+
+    Outputs:
+    - Returns a watertight prism mesh suitable for boolean intersection.
     """
     # Ensure closed polygon
     if not np.allclose(boundary_points[0], boundary_points[-1]):
@@ -1882,6 +1896,7 @@ def offset_polyline(points: np.ndarray, dist: float, constrain_axis: int = None)
 
 
 def save_lines_obj(path: str, lines: list[np.ndarray], z: float = 0.0):
+    """Write one or more 2D polylines to an OBJ file for debugging."""
     with open(path, "w") as f:
         f.write("# Corridor lines\n")
         vertex_offset = 1
@@ -1906,6 +1921,7 @@ def save_graph_obj(
     mm_per_px_y: float,
     z: float = 0.0,
 ):
+    """Write an intersection search graph to OBJ as points plus line segments."""
     with open(path, "w") as f:
         f.write("# Intersection search graph\n")
         for point_rc in coords_rc:
@@ -1939,10 +1955,130 @@ def _flip_points_across_x_axis(points_xy: np.ndarray, total_height_mm: float) ->
 
 
 def _flip_mesh_across_x_axis(mesh: trimesh.Trimesh, total_height_mm: float) -> trimesh.Trimesh:
+    """Mirror a mesh across the X axis and keep it in positive Y coordinates."""
     mesh = mesh.copy()
     mesh.apply_scale([1.0, -1.0, 1.0])
     mesh.apply_translation([0.0, float(total_height_mm), 0.0])
     return mesh
+
+
+def _empty_mesh_for_tile(tx: int, ty: int) -> trimesh.Trimesh:
+    """Create an empty mesh placeholder and record the tile coordinate in metadata."""
+    mesh = trimesh.Trimesh(
+        vertices=np.zeros((0, 3), dtype=float),
+        faces=np.zeros((0, 3), dtype=np.int64),
+        process=False,
+    )
+    mesh.metadata["tile_coord"] = (int(tx), int(ty))
+    return mesh
+
+
+def _normalize_tile_coords(
+    tile_coords: Optional[list[tuple[float, float]]],
+    *,
+    nx: int,
+    ny: int,
+) -> list[tuple[int, int]]:
+    """Normalize optional tile coordinates into unique integer `(tx, ty)` pairs."""
+    if tile_coords is None:
+        return [(tx, ty) for ty in range(int(ny)) for tx in range(int(nx))]
+
+    out: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for coord in tile_coords:
+        if len(coord) != 2:
+            raise ValueError(f"Invalid tile coordinate {coord!r}; expected a 2-tuple like (2, 3).")
+        tx = int(coord[0])
+        ty = int(coord[1])
+        if tx < 0 or tx >= int(nx) or ty < 0 or ty >= int(ny):
+            raise ValueError(f"Tile coordinate {(tx, ty)!r} is out of range for a {nx}x{ny} tiling.")
+        key = (tx, ty)
+        if key not in seen:
+            out.append(key)
+            seen.add(key)
+    return out
+
+
+def cut_mesh_into_tiles(
+    mesh: trimesh.Trimesh,
+    horizontal_cutlines: list[np.ndarray],
+    vertical_cutlines: list[np.ndarray],
+    clearance: float,
+    tile_coords: Optional[list[tuple[float, float]]] = None,
+) -> list[trimesh.Trimesh]:
+    """
+    Inputs:
+    - `mesh`: watertight source mesh to split.
+    - `horizontal_cutlines`: ordered top-to-bottom list of 2D cut polylines.
+    - `vertical_cutlines`: ordered left-to-right list of 2D cut polylines.
+    - `clearance`: total gap between neighboring tiles in mesh XY units.
+    - `tile_coords`: optional list of `(tx, ty)` tile coordinates to extract.
+
+    Outputs:
+    - Returns the cut tile meshes in row-major order when `tile_coords` is `None`,
+      or in the same order as the requested coordinates otherwise.
+    - Each returned mesh stores its `(tx, ty)` coordinate in `mesh.metadata["tile_coord"]`.
+    """
+    if mesh.is_empty:
+        raise ValueError("Input mesh is empty")
+
+    horizontal = [np.asarray(line, dtype=float) for line in horizontal_cutlines]
+    vertical = [np.asarray(line, dtype=float) for line in vertical_cutlines]
+    nx = len(vertical) + 1
+    ny = len(horizontal) + 1
+    requested_tiles = _normalize_tile_coords(tile_coords, nx=nx, ny=ny)
+
+    bounds = np.asarray(mesh.bounds, dtype=float)
+    if bounds.shape != (2, 3) or not np.all(np.isfinite(bounds)):
+        raise ValueError("Input mesh bounds are invalid")
+
+    min_x, min_y, min_z = bounds[0]
+    max_x, max_y, max_z = bounds[1]
+    xy_span = max(float(max_x - min_x), float(max_y - min_y), 1.0)
+    xy_pad = max(float(clearance), 0.005 * xy_span, 0.5)
+    z_pad = max(1.0, 0.05 * max(float(max_z - min_z), 1.0))
+
+    left_x = float(min_x) - xy_pad
+    right_x = float(max_x) + xy_pad
+    top_y = float(min_y) - xy_pad
+    bottom_y = float(max_y) + xy_pad
+    half_clearance = float(clearance) / 2.0
+    z_min = float(min_z) - z_pad
+    z_max = float(max_z) + z_pad
+
+    # The outer tool boundaries sit slightly outside the source mesh so boolean
+    # operations do not coincide exactly with an existing vertical wall.
+    top_edge = np.array([[left_x, top_y], [right_x, top_y]], dtype=float)
+    bottom_edge = np.array([[left_x, bottom_y], [right_x, bottom_y]], dtype=float)
+    left_edge = np.array(  [[left_x, top_y], [left_x, bottom_y]], dtype=float)
+    right_edge = np.array([[right_x, top_y], [right_x, bottom_y]], dtype=float)
+
+    row_slices: dict[int, trimesh.Trimesh] = {}
+    for ty in sorted({ty for _tx, ty in requested_tiles}):
+        top_line = top_edge if ty == 0 else offset_polyline(horizontal[ty - 1], -half_clearance, constrain_axis=0)
+        bot_line = bottom_edge if ty == ny - 1 else offset_polyline(horizontal[ty], half_clearance, constrain_axis=0)
+        row_tool = create_extruded_tool(np.vstack([top_line, bot_line[::-1]]), z_min, z_max)
+        row_slices[ty] = _mesh_intersection(mesh, row_tool, preferred_engine="manifold")
+
+    cut_meshes: list[trimesh.Trimesh] = []
+    for tx, ty in requested_tiles:
+        row_slice = row_slices[ty]
+        if row_slice.is_empty:
+            cut_meshes.append(_empty_mesh_for_tile(tx, ty))
+            continue
+
+        left_line = left_edge if tx == 0 else offset_polyline(vertical[tx - 1], half_clearance, constrain_axis=1)
+        right_line = right_edge if tx == nx - 1 else offset_polyline(vertical[tx], -half_clearance, constrain_axis=1)
+        col_tool = create_extruded_tool(np.vstack([left_line, right_line[::-1]]), z_min, z_max)
+        tile_mesh = _mesh_intersection(row_slice, col_tool, preferred_engine="manifold")
+        if tile_mesh.is_empty:
+            cut_meshes.append(_empty_mesh_for_tile(tx, ty))
+            continue
+
+        tile_mesh.metadata["tile_coord"] = (int(tx), int(ty))
+        cut_meshes.append(tile_mesh)
+
+    return cut_meshes
 
 
 def _worker_build_corridor_line(args):
@@ -2030,6 +2166,14 @@ def _effective_fitting_clearance_mm(args) -> float:
 
 
 def load_raster_context(args, log: logging.Logger) -> RasterContext:
+    """
+    Inputs:
+    - Parsed CLI arguments and a logger.
+
+    Outputs:
+    - Returns the loaded DEM plus all physical sizing metadata needed by the
+      corridor and mesh-export pipeline.
+    """
     local_crs = choose_local_crs(args.lat_min, args.lat_max, args.lon_min, args.lon_max)
     _, _, _, _, bbox_w_m, bbox_h_m = project_bbox_to_local_m(
         args.lat_min, args.lat_max, args.lon_min, args.lon_max, local_crs
@@ -2139,6 +2283,13 @@ def compute_corridor_lines_parallel(
     workers: int,
     log: logging.Logger,
 ) -> list[dict]:
+    """
+    Inputs:
+    - Raster context, tiling plan, parsed args, worker count, and logger.
+
+    Outputs:
+    - Returns one solved separating polyline per overlap corridor.
+    """
     if not plan.corridors:
         raise RuntimeError("No corridors computed (check bed/overlap/final size settings).")
 
@@ -2825,6 +2976,15 @@ def _parse_export_tile_selection(export_meshes: Optional[list[str]], nx: int, ny
 
 
 def _worker_export_tile_mesh(args):
+    """
+    Inputs:
+    - Serialized tile export task arguments, including one DEM crop and the
+      neighboring cutline geometry needed to isolate a single tile.
+
+    Outputs:
+    - Returns a small status dict describing a successful export, empty result,
+      or failure for one tile.
+    """
     (
         tx,
         ty,
@@ -2872,6 +3032,8 @@ def _worker_export_tile_mesh(args):
             origin_x_mm=float(crop_x0_px) * float(mm_per_px_x),
             origin_y_mm=float(crop_y0_px) * float(mm_per_px_y),
         )
+        # Cut sequentially: first isolate the requested horizontal strip, then
+        # isolate the matching column strip inside that slice.
         row_tool = create_extruded_tool(np.vstack([top_line, bot_line[::-1]]), float(z_min), float(z_max))
         row_slice = _mesh_intersection(local_mesh, row_tool, preferred_engine="manifold")
         if row_slice.is_empty:
@@ -2907,6 +3069,13 @@ def export_tile_meshes(
     args,
     log: logging.Logger,
 ):
+    """
+    Inputs:
+    - Solved corridor lines, raster context, tiling plan, parsed args, and logger.
+
+    Outputs:
+    - Writes the selected tile meshes to disk and logs progress.
+    """
     out_dir = Path(args.mesh_out_dir).expanduser() if str(args.mesh_out_dir).strip() else Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3116,6 +3285,7 @@ def export_tile_meshes(
 
 
 def main():
+    """Run the full DEM -> corridor -> optional tile-mesh export pipeline."""
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger("depth_map")
     args = parse_args()
