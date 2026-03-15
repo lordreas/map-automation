@@ -168,8 +168,10 @@ def parse_args():
     )
     ap.add_argument(
         "--export-meshes",
-        action="store_true",
-        help="If set, export one STL mesh per tile region.",
+        nargs="*",
+        default=None,
+        metavar="TY_TX",
+        help="Export STL meshes. With no tile ids, export all tiles. With tile ids like 02_03 02_01, export only that subset.",
     )
     ap.add_argument(
         "--mesh-out-dir",
@@ -197,7 +199,7 @@ def parse_args():
     )
     ap.add_argument(
         "--fitting-clearance",
-        default=0.2,
+        default=0.15,
         type=float,
         help="Total clearance gap between tiles (mm). Edges are offset by half this amount.",
     )
@@ -2800,6 +2802,28 @@ def _tile_crop_bounds_px(
     return x0_px, x1_px, y0_px, y1_px
 
 
+def _parse_export_tile_selection(export_meshes: Optional[list[str]], nx: int, ny: int) -> Optional[set[tuple[int, int]]]:
+    if export_meshes is None or len(export_meshes) == 0:
+        return None
+
+    selected: set[tuple[int, int]] = set()
+    for raw in export_meshes:
+        token = str(raw).strip()
+        if token.startswith("tile_"):
+            token = token[5:]
+        parts = token.split("_")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            raise ValueError(f"Invalid tile selector '{raw}'. Use TY_TX, for example 02_03.")
+        ty = int(parts[0])
+        tx = int(parts[1])
+        if ty < 0 or ty >= int(ny) or tx < 0 or tx >= int(nx):
+            raise ValueError(
+                f"Tile selector '{raw}' is out of range. Valid rows: 00..{int(ny) - 1:02d}, cols: 00..{int(nx) - 1:02d}."
+            )
+        selected.add((tx, ty))
+    return selected
+
+
 def _worker_export_tile_mesh(args):
     (
         tx,
@@ -2915,6 +2939,7 @@ def export_tile_meshes(
     col_starts_mm = plan_tile_starts_mm(ctx.eff_width_mm, args.bed_width_mm, args.overlap_width_mm)
     row_starts_mm = plan_tile_starts_mm(ctx.eff_height_mm, args.bed_height_mm, args.overlap_width_mm)
     half_clearance = _effective_fitting_clearance_mm(args) / 2.0
+    selected_tiles = _parse_export_tile_selection(args.export_meshes, nx, ny)
 
     missing_cols = [idx for idx in range(1, nx) if idx not in col_lines]
     missing_rows = [idx for idx in range(1, ny) if idx not in row_lines]
@@ -2936,6 +2961,8 @@ def export_tile_meshes(
             else offset_polyline(row_lines[ty + 1], half_clearance, constrain_axis=0)
         )
         for tx in range(nx):
+            if selected_tiles is not None and (tx, ty) not in selected_tiles:
+                continue
             left_line = (
                 np.array([[0.0, 0.0], [0.0, float(ctx.eff_height_mm)]], dtype=float)
                 if tx == 0
@@ -2980,6 +3007,11 @@ def export_tile_meshes(
             )
 
     export_workers = max(1, min(int(args.mesh_export_workers), len(tasks)))
+    if selected_tiles is None:
+        log.info("exporting all tiles")
+    else:
+        chosen = ", ".join(f"{ty:02d}_{tx:02d}" for tx, ty in sorted(selected_tiles, key=lambda item: (item[1], item[0])))
+        log.info("exporting selected tiles: %s", chosen)
     log.info("export tiles via local crops: %d tasks, workers=%d", len(tasks), export_workers)
     if not tasks:
         log.warning("No tile export tasks were generated")
@@ -3102,7 +3134,7 @@ def main():
     results = refine_intersections_parallel(results, ctx, args, workers, log)
     plot_corridor_lines(results, ctx, args)
 
-    if args.export_meshes:
+    if args.export_meshes is not None:
         export_tile_meshes(results, ctx, plan, args, log)
         plt.close("all")
         return
