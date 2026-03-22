@@ -264,13 +264,16 @@ def build_elevation_map(
     https://elevation-tiles-prod.s3.amazonaws.com
     """
     os.makedirs(cache_dir, exist_ok=True)
+    cache_version = "bboxmerge_v2"
 
     cache_suffix = ""
     if output_shape is not None:
         out_h = max(1, int(output_shape[0]))
         out_w = max(1, int(output_shape[1]))
         resamp_name = getattr(merge_resampling, "name", str(merge_resampling)).lower()
-        cache_suffix = f"_shape_{out_h}x{out_w}_resamp_{resamp_name}"
+        cache_suffix = f"_shape_{out_h}x{out_w}_resamp_{resamp_name}_{cache_version}"
+    else:
+        cache_suffix = f"_{cache_version}"
 
     array_cache_path = os.path.join(cache_dir, f"elevation_{lat_min}_{lat_max}_{lon_min}_{lon_max}{cache_suffix}.npy")
     transform_cache_path = os.path.join(cache_dir, f"elevation_{lat_min}_{lat_max}_{lon_min}_{lon_max}{cache_suffix}_transform.pkl")
@@ -315,6 +318,16 @@ def build_elevation_map(
     # Merge multiple tiles into one elevation array. When output_shape is provided,
     # cap the merged raster resolution before materializing it in memory.
     merge_kwargs = {}
+    # Crop the merge to the requested bbox instead of materializing the full
+    # integer-degree tile union. Otherwise the returned raster extent is larger
+    # than the requested region and degree-tile seams land at regular positions
+    # in the downstream downsampled DEM.
+    merge_kwargs["bounds"] = (
+        float(lon_min),
+        float(lat_min),
+        float(lon_max),
+        float(lat_max),
+    )
     if output_shape is not None and src_files_to_mosaic:
         out_h = max(1, int(output_shape[0]))
         out_w = max(1, int(output_shape[1]))

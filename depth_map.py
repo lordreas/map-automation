@@ -66,10 +66,14 @@ def compute_corridors_1d(total_px: int, starts_px: list[int], overlap_px: int, a
 
 def plan_tile_starts_mm(total_mm: float, bed_mm: float, overlap_mm: float) -> list[float]:
     """
-    start_0 = 0
-    start_i = start_{i-1} + bed_mm - overlap_mm
-    Stop once the last tile's end >= total_mm.
+    Choose the minimum tile count needed to span `total_mm`, then center the
+    repeating bed/overlap pattern so the outer visible strips are symmetric.
+
+    The first start may be slightly negative and the last tile may end slightly
+    past `total_mm`; downstream code clips each tile to the real map extent.
     """
+    if total_mm <= 0:
+        raise ValueError("total dimension must be > 0")
     if bed_mm <= 0:
         raise ValueError("bed dimension must be > 0")
     if overlap_mm < 0:
@@ -77,15 +81,12 @@ def plan_tile_starts_mm(total_mm: float, bed_mm: float, overlap_mm: float) -> li
     if overlap_mm >= bed_mm:
         raise ValueError("overlap_width_mm must be < bed dimension")
 
-    starts = [0.0]
     step = bed_mm - overlap_mm
-    # Guard against infinite loops due to floating error
-    for _ in range(1, 10_000):
-        last_start = starts[-1]
-        if last_start + bed_mm >= total_mm:
-            break
-        starts.append(last_start + step)
-    return starts
+    tile_count = max(1, int(np.ceil(max(float(total_mm) - float(overlap_mm), 0.0) / float(step))))
+    coverage_mm = float(bed_mm) + float(tile_count - 1) * float(step)
+    excess_mm = max(0.0, coverage_mm - float(total_mm))
+    start0_mm = -0.5 * excess_mm
+    return [start0_mm + float(i) * float(step) for i in range(tile_count)]
 
 
 class Timer:
@@ -112,11 +113,11 @@ def parse_args():
     ap.add_argument("--lon-max", default=16.4, type=float)
 
     # all physical parameters in mm
-    ap.add_argument("--final-width-mm",   default=2000, type=float, help="Assembled final print width (mm)")
-    ap.add_argument("--final-height-mm",  default=1500,  type=float, help="Assembled final print height (mm)")
+    ap.add_argument("--final-width-mm",   default=1500, type=float, help="Assembled final print width (mm)")
+    ap.add_argument("--final-height-mm",  default=1000,  type=float, help="Assembled final print height (mm)")
     ap.add_argument("--bed-width-mm",     default=320,  type=float, help="Printer bed width (mm)")
     ap.add_argument("--bed-height-mm",    default=320,  type=float, help="Printer bed height (mm)")
-    ap.add_argument("--overlap-width-mm", default=40,   type=float, help="Overlap width (mm)")
+    ap.add_argument("--overlap-width-mm", default=50,   type=float, help="Overlap width (mm)")
     ap.add_argument("--elevation-interval-m", default=50.0, type=float, help="Contour interval in meters")
     ap.add_argument(
         "--elevation-fine-threshold-m",
@@ -333,6 +334,23 @@ def _clamp_nonnegative(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _replace_hgt_voids_with_nan(arr: np.ndarray, void_threshold: float = -32000.0) -> np.ndarray:
+    """
+    Convert HGT/NASADEM-style void sentinels to NaN before downsampling.
+
+    The merge step can return integer rasters with `-32768` void samples on
+    outer borders or tile seams. Those should remain invalid during the
+    min/max pyramid instead of being clamped to sea level first.
+    """
+    arr = np.asarray(arr)
+    void_mask = np.isfinite(arr) & (arr <= float(void_threshold))
+    if not np.any(void_mask):
+        return arr
+    out = np.asarray(arr, dtype=np.float32).copy()
+    out[void_mask] = np.nan
+    return out
+
+
 def _build_contour_levels(
     crop_min: float,
     crop_max: float,
@@ -501,6 +519,8 @@ class RasterContext:
 @dataclass
 class TilingPlan:
     corridors: list[dict]
+    col_starts_mm: list[float]
+    row_starts_mm: list[float]
     col_starts_px: list[int]
     row_starts_px: list[int]
     overlap_px_x: int
@@ -529,6 +549,23 @@ def _px_to_m_x(x_px: np.ndarray, img_w: int, bbox_w_m: float) -> np.ndarray:
 def _px_to_m_y(y_px: np.ndarray, img_h: int, bbox_h_m: float) -> np.ndarray:
     denom = float(max(1, img_h - 1))
     return (np.asarray(y_px, dtype=float) / denom) * float(bbox_h_m)
+
+
+def _clip_tile_interval_mm(start_mm: float, bed_mm: float, total_mm: float) -> tuple[float, float]:
+    """Clip one nominal tile interval to the real map extent in mm."""
+    lo_mm = max(0.0, float(start_mm))
+    hi_mm = min(float(total_mm), float(start_mm) + float(bed_mm))
+    return lo_mm, hi_mm
+
+
+def _interval_mm_to_px_bounds(lo_mm: float, hi_mm: float, total_mm: float, total_px: int) -> tuple[int, int]:
+    """Convert a continuous mm interval to inclusive raster coverage via floor/ceil."""
+    if hi_mm <= lo_mm:
+        return 0, 0
+    px_per_mm = float(total_px) / float(max(total_mm, 1e-9))
+    lo_px = max(0, int(np.floor(float(lo_mm) * px_per_mm)))
+    hi_px = min(int(total_px), int(np.ceil(float(hi_mm) * px_per_mm)))
+    return lo_px, hi_px
 
 
 def _axis_interval(points_rc: np.ndarray, axis: str) -> tuple[float, float]:
@@ -2200,7 +2237,9 @@ def load_raster_context(args, log: logging.Logger) -> RasterContext:
         )
         if elev_map is None or elev_map.size == 0:
             raise RuntimeError("build_elevation_map returned an empty array")
-        elev_map = _clamp_nonnegative(elev_map)
+        raw_void_count = int(np.sum(np.isfinite(elev_map) & (elev_map <= -32000)))
+        raw_negative_count = int(np.sum(np.isfinite(elev_map) & (elev_map < 0)))
+        elev_map = _replace_hgt_voids_with_nan(elev_map)
         img_h, img_w = elev_map.shape
 
     log.info(
@@ -2209,6 +2248,11 @@ def load_raster_context(args, log: logging.Logger) -> RasterContext:
         int(premerge_shape[1]),
         int(img_h),
         int(img_w),
+    )
+    log.info(
+        "merged raster negatives: total=%d, hgt_voids=%d",
+        raw_negative_count,
+        raw_void_count,
     )
 
     with Timer("downsample elevation_map", log):
@@ -2244,6 +2288,9 @@ def load_raster_context(args, log: logging.Logger) -> RasterContext:
 def plan_tiling(ctx: RasterContext, args) -> TilingPlan:
     col_starts_mm = plan_tile_starts_mm(ctx.eff_width_mm, args.bed_width_mm, args.overlap_width_mm)
     row_starts_mm = plan_tile_starts_mm(ctx.eff_height_mm, args.bed_height_mm, args.overlap_width_mm)
+    # Keep centered tiling in mm for export/cropping, but build corridor windows
+    # with the original pixel convention: rounded nominal starts plus a fixed
+    # rounded overlap width. The contour solver was tuned against that setup.
     col_starts_px = [_mm_to_px_x(mm, ctx.eff_width_mm, ctx.img_w) for mm in col_starts_mm]
     row_starts_px = [_mm_to_px_y(mm, ctx.eff_height_mm, ctx.img_h) for mm in row_starts_mm]
     overlap_px_x = _mm_to_px_x(args.overlap_width_mm, ctx.eff_width_mm, ctx.img_w)
@@ -2263,6 +2310,8 @@ def plan_tiling(ctx: RasterContext, args) -> TilingPlan:
 
     return TilingPlan(
         corridors=corridors,
+        col_starts_mm=col_starts_mm,
+        row_starts_mm=row_starts_mm,
         col_starts_px=col_starts_px,
         row_starts_px=row_starts_px,
         overlap_px_x=overlap_px_x,
@@ -2923,10 +2972,8 @@ def _tile_bounds_mm(
     tx: int,
     ty: int,
 ) -> tuple[float, float, float, float]:
-    x0_mm = float(col_starts_mm[tx])
-    y0_mm = float(row_starts_mm[ty])
-    x1_mm = min(float(ctx.eff_width_mm), x0_mm + float(args.bed_width_mm))
-    y1_mm = min(float(ctx.eff_height_mm), y0_mm + float(args.bed_height_mm))
+    x0_mm, x1_mm = _clip_tile_interval_mm(float(col_starts_mm[tx]), float(args.bed_width_mm), float(ctx.eff_width_mm))
+    y0_mm, y1_mm = _clip_tile_interval_mm(float(row_starts_mm[ty]), float(args.bed_height_mm), float(ctx.eff_height_mm))
     return x0_mm, x1_mm, y0_mm, y1_mm
 
 
@@ -3105,8 +3152,8 @@ def export_tile_meshes(
     global_h_max = float(np.nanmax(ctx.elev_map))
     if not np.isfinite(global_h_min) or not np.isfinite(global_h_max):
         raise RuntimeError("Cannot export meshes because the global elevation range is invalid")
-    col_starts_mm = plan_tile_starts_mm(ctx.eff_width_mm, args.bed_width_mm, args.overlap_width_mm)
-    row_starts_mm = plan_tile_starts_mm(ctx.eff_height_mm, args.bed_height_mm, args.overlap_width_mm)
+    col_starts_mm = plan.col_starts_mm
+    row_starts_mm = plan.row_starts_mm
     half_clearance = _effective_fitting_clearance_mm(args) / 2.0
     selected_tiles = _parse_export_tile_selection(args.export_meshes, nx, ny)
 
