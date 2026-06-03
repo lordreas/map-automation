@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from gpx2pdf import build_elevation_map
 import argparse
 import numpy as np
@@ -181,6 +183,15 @@ def parse_args():
         help="Output directory for STL meshes (default: current working directory).",
     )
     ap.add_argument(
+        "--stencil-stl-path",
+        default="",
+        type=str,
+        help=(
+            "Optional STL mesh to boolean-subtract from each tile just before export. "
+            "Coordinates should match the exported tile coordinate system."
+        ),
+    )
+    ap.add_argument(
         "--bottom-thickness-mm",
         default=10,
         type=float,
@@ -188,7 +199,7 @@ def parse_args():
     )
     ap.add_argument(
         "--desired-height-mm",
-        default=50.0,
+        default=35.0,
         type=float,
         help="Relief height above the bottom thickness (mm). Heights are normalized into [bottom_thickness_mm, bottom_thickness_mm + desired_height_mm] after the nonlinear mapping.",
     )
@@ -1677,6 +1688,64 @@ def _polyline_to_cut_row_at_col(rows: np.ndarray, cols: np.ndarray, img_w: int) 
     return np.interp(cc, uc, ur, left=ur[0], right=ur[-1])
 
 
+def _bottom_core_star_faces(
+    h: int,
+    w: int,
+    offset: int,
+    origin_x_mm: float,
+    origin_y_mm: float,
+    mm_per_px_x: float,
+    mm_per_px_y: float,
+    core_rect_mm: tuple[float, float, float, float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return a mask for raster bottom cells inside a safe rectangular core plus
+    one bottom center vertex and star triangles that fill that rectangle.
+    """
+    x0_mm, x1_mm, y0_mm, y1_mm = (float(v) for v in core_rect_mm)
+    if x1_mm <= x0_mm or y1_mm <= y0_mm or h < 3 or w < 3:
+        return (
+            np.zeros((max(0, h - 1), max(0, w - 1)), dtype=bool),
+            np.zeros((0, 3), dtype=float),
+            np.zeros((0, 3), dtype=np.int64),
+        )
+
+    c0 = max(0, int(np.ceil((x0_mm - float(origin_x_mm)) / float(mm_per_px_x))))
+    c1 = min(w - 1, int(np.floor((x1_mm - float(origin_x_mm)) / float(mm_per_px_x))))
+    r0 = max(0, int(np.ceil((y0_mm - float(origin_y_mm)) / float(mm_per_px_y))))
+    r1 = min(h - 1, int(np.floor((y1_mm - float(origin_y_mm)) / float(mm_per_px_y))))
+
+    if c1 - c0 < 2 or r1 - r0 < 2:
+        return (
+            np.zeros((h - 1, w - 1), dtype=bool),
+            np.zeros((0, 3), dtype=float),
+            np.zeros((0, 3), dtype=np.int64),
+        )
+
+    cell_mask = np.zeros((h - 1, w - 1), dtype=bool)
+    cell_mask[r0:r1, c0:c1] = True
+
+    top_edge = [(r0, c) for c in range(c0, c1 + 1)]
+    right_edge = [(r, c1) for r in range(r0 + 1, r1 + 1)]
+    bottom_edge = [(r1, c) for c in range(c1 - 1, c0 - 1, -1)]
+    left_edge = [(r, c0) for r in range(r1 - 1, r0, -1)]
+    boundary_rc = top_edge + right_edge + bottom_edge + left_edge
+    boundary_ids = np.array([r * w + c + offset for r, c in boundary_rc], dtype=np.int64)
+
+    center_x = float(origin_x_mm) + 0.5 * float(c0 + c1) * float(mm_per_px_x)
+    center_y = float(origin_y_mm) + 0.5 * float(r0 + r1) * float(mm_per_px_y)
+    center_vertex = np.array([[center_x, center_y, 0.0]], dtype=float)
+    center_id = int(offset + h * w)
+
+    next_ids = np.roll(boundary_ids, -1)
+    star_faces = np.column_stack((
+        boundary_ids,
+        np.full(len(boundary_ids), center_id, dtype=np.int64),
+        next_ids,
+    ))
+    return cell_mask, center_vertex, star_faces
+
+
 def generate_full_mesh(
     elev_map: np.ndarray,
     mm_per_px_x: float,
@@ -1688,6 +1757,7 @@ def generate_full_mesh(
     norm_h_max: Optional[float] = None,
     origin_x_mm: float = 0.0,
     origin_y_mm: float = 0.0,
+    bottom_core_rect_mm: Optional[tuple[float, float, float, float]] = None,
 ) -> trimesh.Trimesh:
     """
     Inputs:
@@ -1697,6 +1767,8 @@ def generate_full_mesh(
     - `height_exponent`: optional nonlinear scaling on normalized heights.
     - `norm_h_min`, `norm_h_max`: optional global normalization range.
     - `origin_x_mm`, `origin_y_mm`: XY offset for cropped local meshes.
+    - `bottom_core_rect_mm`: optional XY rectangle whose flat bottom is filled
+      with star triangles instead of the full raster triangulation.
 
     Outputs:
     - Returns one watertight terrain solid mesh in mm coordinates.
@@ -1775,9 +1847,27 @@ def generate_full_mesh(
     
     # b00(0,0)->b10(0,1)->b11(1,1) => (0,1)x(1,0) = (0,0,-1) -Z
     # b00(0,0)->b11(1,1)->b01(1,0) => (1,1)x(0,-1) = (0,0,-1) -Z
-    f3 = np.stack((b00, b10, b11), axis=-1).reshape(-1, 3)
-    f4 = np.stack((b00, b11, b01), axis=-1).reshape(-1, 3)
-    faces_bottom = np.vstack((f3, f4))
+    f3_grid = np.stack((b00, b10, b11), axis=-1)
+    f4_grid = np.stack((b00, b11, b01), axis=-1)
+    extra_bottom_vertices = np.zeros((0, 3), dtype=float)
+    star_bottom_faces = np.zeros((0, 3), dtype=np.int64)
+    if bottom_core_rect_mm is not None:
+        core_cell_mask, extra_bottom_vertices, star_bottom_faces = _bottom_core_star_faces(
+            h,
+            w,
+            offset,
+            float(origin_x_mm),
+            float(origin_y_mm),
+            float(mm_per_px_x),
+            float(mm_per_px_y),
+            bottom_core_rect_mm,
+        )
+        f3 = f3_grid[~core_cell_mask].reshape(-1, 3)
+        f4 = f4_grid[~core_cell_mask].reshape(-1, 3)
+    else:
+        f3 = f3_grid.reshape(-1, 3)
+        f4 = f4_grid.reshape(-1, 3)
+    faces_bottom = np.vstack((f3, f4, star_bottom_faces))
     
     # Side faces
     # Top edge (r=0): v0(c) -> v0(c+1) -> b0(c+1) -> b0(c)
@@ -1819,7 +1909,7 @@ def generate_full_mesh(
     f_right_side_1 = np.stack((right_v0, right_b0, right_b1), axis=-1)
     f_right_side_2 = np.stack((right_v0, right_b1, right_v1), axis=-1)
     
-    all_vertices = np.vstack((vertices_top, vertices_bottom))
+    all_vertices = np.vstack((vertices_top, vertices_bottom, extra_bottom_vertices))
     all_faces = np.vstack((
         faces_top, faces_bottom,
         f_top_side_1, f_top_side_2,
@@ -1983,6 +2073,27 @@ def _mesh_intersection(mesh: trimesh.Trimesh, tool: trimesh.Trimesh, preferred_e
         except Exception:
             pass
     return mesh.intersection(tool)
+
+
+def _mesh_difference(mesh: trimesh.Trimesh, tool: trimesh.Trimesh, preferred_engine: Optional[str] = "manifold"):
+    if preferred_engine:
+        try:
+            return mesh.difference(tool, engine=preferred_engine)
+        except Exception:
+            pass
+    return mesh.difference(tool)
+
+
+def _load_stencil_mesh(stencil_stl_path: str) -> trimesh.Trimesh:
+    loaded = trimesh.load(stencil_stl_path, force="mesh", process=True)
+    if isinstance(loaded, trimesh.Scene):
+        parts = [geom for geom in loaded.geometry.values() if isinstance(geom, trimesh.Trimesh) and not geom.is_empty]
+        if not parts:
+            raise ValueError(f"Stencil STL contains no mesh geometry: {stencil_stl_path}")
+        loaded = trimesh.util.concatenate(parts)
+    if not isinstance(loaded, trimesh.Trimesh) or loaded.is_empty:
+        raise ValueError(f"Stencil STL contains no mesh geometry: {stencil_stl_path}")
+    return loaded
 
 
 def _flip_points_across_x_axis(points_xy: np.ndarray, total_height_mm: float) -> np.ndarray:
@@ -3000,6 +3111,32 @@ def _tile_crop_bounds_px(
     return x0_px, x1_px, y0_px, y1_px
 
 
+def _tile_bottom_core_rect_mm(
+    args,
+    tile_bounds_mm: tuple[float, float, float, float],
+    tx: int,
+    ty: int,
+    nx: int,
+    ny: int,
+) -> Optional[tuple[float, float, float, float]]:
+    """Return the non-corridor rectangle where the flat bottom can be star-filled."""
+    x0_mm, x1_mm, y0_mm, y1_mm = (float(v) for v in tile_bounds_mm)
+    overlap_mm = max(0.0, float(args.overlap_width_mm))
+
+    if int(tx) > 0:
+        x0_mm += overlap_mm
+    if int(tx) < int(nx) - 1:
+        x1_mm -= overlap_mm
+    if int(ty) > 0:
+        y0_mm += overlap_mm
+    if int(ty) < int(ny) - 1:
+        y1_mm -= overlap_mm
+
+    if x1_mm <= x0_mm or y1_mm <= y0_mm:
+        return None
+    return x0_mm, x1_mm, y0_mm, y1_mm
+
+
 def _parse_export_tile_selection(export_meshes: Optional[list[str]], nx: int, ny: int) -> Optional[set[tuple[int, int]]]:
     if export_meshes is None or len(export_meshes) == 0:
         return None
@@ -3058,6 +3195,8 @@ def _worker_export_tile_mesh(args):
         bot_line,
         left_line,
         right_line,
+        bottom_core_rect,
+        stencil_stl_path,
     ) = args
 
     t0 = time.perf_counter()
@@ -3078,6 +3217,7 @@ def _worker_export_tile_mesh(args):
             norm_h_max=float(norm_h_max),
             origin_x_mm=float(crop_x0_px) * float(mm_per_px_x),
             origin_y_mm=float(crop_y0_px) * float(mm_per_px_y),
+            bottom_core_rect_mm=bottom_core_rect,
         )
         # Cut sequentially: first isolate the requested horizontal strip, then
         # isolate the matching column strip inside that slice.
@@ -3094,6 +3234,11 @@ def _worker_export_tile_mesh(args):
         tile_mesh = _flip_mesh_across_x_axis(tile_mesh, float(total_height_mm))
         if abs(float(print_scale) - 1.0) > 1e-9:
             tile_mesh.apply_scale([float(print_scale), float(print_scale), float(print_scale)])
+        if str(stencil_stl_path).strip():
+            stencil_mesh = _load_stencil_mesh(str(stencil_stl_path))
+            tile_mesh = _mesh_difference(tile_mesh, stencil_mesh, preferred_engine="manifold")
+            if tile_mesh.is_empty:
+                return {"status": "empty", "tx": tx, "ty": ty}
         tile_mesh.export(str(out_path))
         return {
             "status": "ok",
@@ -3125,6 +3270,13 @@ def export_tile_meshes(
     """
     out_dir = Path(args.mesh_out_dir).expanduser() if str(args.mesh_out_dir).strip() else Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
+    stencil_stl_path = ""
+    if str(args.stencil_stl_path).strip():
+        stencil_path = Path(args.stencil_stl_path).expanduser()
+        if not stencil_path.exists():
+            raise FileNotFoundError(f"--stencil-stl-path does not exist: {stencil_path}")
+        stencil_stl_path = str(stencil_path)
+        log.info("stencil subtraction enabled: %s", stencil_stl_path)
 
     lines_mm = []
     for result in results:
@@ -3191,6 +3343,7 @@ def export_tile_meshes(
             )
             tile_bounds_mm = _tile_bounds_mm(ctx, args, col_starts_mm, row_starts_mm, tx, ty)
             crop_x0_px, crop_x1_px, crop_y0_px, crop_y1_px = _tile_crop_bounds_px(ctx, args, tile_bounds_mm)
+            bottom_core_rect = _tile_bottom_core_rect_mm(args, tile_bounds_mm, tx, ty, nx, ny)
             out_path = out_dir / f"tile_{ty:02d}_{tx:02d}.stl"
             tasks.append(
                 (
@@ -3219,6 +3372,8 @@ def export_tile_meshes(
                     np.asarray(bot_line, dtype=np.float32),
                     np.asarray(left_line, dtype=np.float32),
                     np.asarray(right_line, dtype=np.float32),
+                    bottom_core_rect,
+                    stencil_stl_path,
                 )
             )
 
@@ -3269,6 +3424,8 @@ def export_tile_meshes(
                 bot_line,
                 left_line,
                 right_line,
+                bottom_core_rect,
+                stencil_stl_path,
             )
             for (
                 tx,
@@ -3296,6 +3453,8 @@ def export_tile_meshes(
                 bot_line,
                 left_line,
                 right_line,
+                bottom_core_rect,
+                stencil_stl_path,
             ) in tasks
         ]
 
