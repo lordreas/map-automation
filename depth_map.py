@@ -32,6 +32,61 @@ except Exception:
     KDTree = None
 
 
+# How far the relief outline is pushed outside the map on tile edges that are
+# not shared with a neighbor, so no relief is cut into the outer walls.
+RELIEF_BORDER_PAD_MM = 5.0
+
+# Shortest relief pocket that is still cut. Where the wall is too low for the two
+# tight bands plus their ramps the pocket collapses to this, which disappears in
+# slicing instead of leaving a degenerate solid for the boolean.
+MIN_POCKET_HEIGHT_MM = 0.1
+
+# The pocket's ramps rise this many times their width, so the printed faces sit
+# near 56 degrees from horizontal instead of exactly on the 45 degree overhang
+# limit, leaving margin where a seam curves inside the band.
+RELIEF_RAMP_FACTOR = 1.5
+
+# The cap is eroded over this many band widths before the top ramp is hung off
+# it, which is what keeps that ramp steep enough on terrain that rises inwards.
+RELIEF_EROSION_FACTOR = 2.0
+
+# Number of nested rings a taper band is split into. One ring per side would let
+# a straight triangle cut across what should be a cone at a convex bend of the
+# seam, and would leave a flat ceiling wherever the seam is narrower than twice
+# the taper and the inner ring disappears locally.
+TAPER_RING_COUNT = 4
+
+# Bottom chamfer height as a multiple of its width. Slightly over 1 so the printed
+# faces stay clear of the 45 degree overhang limit.
+CHAMFER_SLOPE = 1.25
+
+# The chamfer taper runs this far past its width so the cut crosses the tile's
+# bottom plane instead of touching it, which keeps the boolean clean.
+CHAMFER_OVERRUN = 1.2
+
+# Spacing the outline is resampled to before taper fractions are measured off it.
+# The measurement is a nearest-probe distance, so this has to stay well under the
+# smallest distance that matters or it overstates the distance close to the wall.
+_TAPER_PROBE_STEP_MM = 0.01
+
+# Uniform subdivisions applied to a taper domain. The rings alone leave a flat
+# ceiling wherever the seam is narrow enough that an inner ring disappears, since
+# every vertex of such a stretch then sits on the wall. Subdividing puts vertices
+# inside those stretches so the measured distance to the wall can slope them.
+TAPER_SUBDIVISIONS = 2
+
+# How far apart the copies of a split pinch vertex are moved. Far enough that no
+# boolean engine merges them again, small enough to be meaningless in a print.
+_PINCH_NUDGE_MM = 1e-3
+
+# Surface area below which a disconnected shell left behind by a boolean is debris
+# rather than material. A closed shell this small cannot hold a printable volume.
+SCRAP_AREA_MM2 = 1.0
+
+# Coordinate quantum used to weld the two taper patches into one surface.
+_WELD_QUANTUM_MM = 1e-6
+
+
 def _ceil_div(a: float, b: float) -> int:
     return int(np.ceil(a / b))
 
@@ -214,6 +269,43 @@ def parse_args():
         default=0.15,
         type=float,
         help="Total clearance gap between tiles (mm). Edges are offset by half this amount.",
+    )
+    ap.add_argument(
+        "--tight-clearance-height-mm",
+        default=5.0,
+        type=float,
+        help=(
+            "Height of the tight-fitting band on each mating wall (mm): from the tile bottom upwards, "
+            "and from the low-passed top surface downwards. Set to 0 to keep tight walls everywhere."
+        ),
+    )
+    ap.add_argument(
+        "--extra-clearance-mm",
+        default=0.3,
+        type=float,
+        help=(
+            "Extra per-side inset (mm) applied to mating walls between the tight bands, as a friction relief. "
+            "The relieved gap becomes fitting_clearance + 2 * this value. Set to 0 to disable the relief."
+        ),
+    )
+    ap.add_argument(
+        "--chamfer-width-mm",
+        default=0.5,
+        type=float,
+        help=(
+            "How far the chamfer around the bottom edge of every tile reaches in from the wall (mm). "
+            "It is cut slightly steeper than 45 degrees so it prints without support. "
+            "Set to 0 to keep a square bottom edge."
+        ),
+    )
+    ap.add_argument(
+        "--relief-smoothing-mm",
+        default=3.0,
+        type=float,
+        help=(
+            "Gaussian sigma (mm) used to low-pass the terrain top surface that caps the relief cut, "
+            "so the upper relief boundary follows the terrain without high-frequency detail."
+        ),
     )
     ap.add_argument(
         "--nozzle-diameter-mm",
@@ -1697,6 +1789,7 @@ def _bottom_core_star_faces(
     mm_per_px_x: float,
     mm_per_px_y: float,
     core_rect_mm: tuple[float, float, float, float],
+    z_bottom_mm: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Return a mask for raster bottom cells inside a safe rectangular core plus
@@ -1734,7 +1827,7 @@ def _bottom_core_star_faces(
 
     center_x = float(origin_x_mm) + 0.5 * float(c0 + c1) * float(mm_per_px_x)
     center_y = float(origin_y_mm) + 0.5 * float(r0 + r1) * float(mm_per_px_y)
-    center_vertex = np.array([[center_x, center_y, 0.0]], dtype=float)
+    center_vertex = np.array([[center_x, center_y, float(z_bottom_mm)]], dtype=float)
     center_id = int(offset + h * w)
 
     next_ids = np.roll(boundary_ids, -1)
@@ -1744,6 +1837,48 @@ def _bottom_core_star_faces(
         next_ids,
     ))
     return cell_mask, center_vertex, star_faces
+
+
+def _top_z_grid_from_elevation(
+    elev_map: np.ndarray,
+    bottom_thickness_mm: float,
+    desired_height_mm: float,
+    height_exponent: float = 1.0,
+    norm_h_min: Optional[float] = None,
+    norm_h_max: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Inputs:
+    - `elev_map`: 2D elevation raster (NaN marks voids).
+    - `bottom_thickness_mm`, `desired_height_mm`: relief thickness controls.
+    - `height_exponent`: optional nonlinear scaling on normalized heights.
+    - `norm_h_min`, `norm_h_max`: optional global normalization range.
+
+    Outputs:
+    - Returns the printed top-surface Z in mm for every raster sample.
+    """
+    # Normalize heights
+    valid_mask = np.isfinite(elev_map)
+    if not np.any(valid_mask):
+        raise ValueError("Elevation map has no valid data")
+
+    if norm_h_min is None or norm_h_max is None:
+        h_min = float(np.nanmin(elev_map[valid_mask]))
+        h_max = float(np.nanmax(elev_map[valid_mask]))
+    else:
+        h_min = float(norm_h_min)
+        h_max = float(norm_h_max)
+    denom = max(1e-12, h_max - h_min)
+
+    # Normalize to [0, 1]
+    t = (elev_map - h_min) / denom
+    t[~valid_mask] = 0.0 # Handle NaNs by setting to min height
+    np.clip(t, 0.0, 1.0, out=t)
+    if abs(float(height_exponent) - 1.0) > 1e-9:
+        np.power(t, float(height_exponent), out=t)
+
+    # Map to mm Z
+    return bottom_thickness_mm + t * desired_height_mm
 
 
 def generate_full_mesh(
@@ -1773,31 +1908,47 @@ def generate_full_mesh(
     Outputs:
     - Returns one watertight terrain solid mesh in mm coordinates.
     """
-    h, w = elev_map.shape
-    
-    # Normalize heights
-    valid_mask = np.isfinite(elev_map)
-    if not np.any(valid_mask):
-        raise ValueError("Elevation map has no valid data")
+    z_top = _top_z_grid_from_elevation(
+        elev_map,
+        bottom_thickness_mm=bottom_thickness_mm,
+        desired_height_mm=desired_height_mm,
+        height_exponent=height_exponent,
+        norm_h_min=norm_h_min,
+        norm_h_max=norm_h_max,
+    )
+    return build_solid_from_top_z(
+        z_top,
+        mm_per_px_x=mm_per_px_x,
+        mm_per_px_y=mm_per_px_y,
+        origin_x_mm=origin_x_mm,
+        origin_y_mm=origin_y_mm,
+        bottom_core_rect_mm=bottom_core_rect_mm,
+    )
 
-    if norm_h_min is None or norm_h_max is None:
-        h_min = float(np.nanmin(elev_map[valid_mask]))
-        h_max = float(np.nanmax(elev_map[valid_mask]))
-    else:
-        h_min = float(norm_h_min)
-        h_max = float(norm_h_max)
-    denom = max(1e-12, h_max - h_min)
-    
-    # Normalize to [0, 1]
-    t = (elev_map - h_min) / denom
-    t[~valid_mask] = 0.0 # Handle NaNs by setting to min height
-    np.clip(t, 0.0, 1.0, out=t)
-    if abs(float(height_exponent) - 1.0) > 1e-9:
-        np.power(t, float(height_exponent), out=t)
-    
-    # Map to mm Z
-    z_values = bottom_thickness_mm + t * desired_height_mm
-    
+
+def build_solid_from_top_z(
+    z_top: np.ndarray,
+    mm_per_px_x: float,
+    mm_per_px_y: float,
+    origin_x_mm: float = 0.0,
+    origin_y_mm: float = 0.0,
+    z_bottom_mm: float = 0.0,
+    bottom_core_rect_mm: Optional[tuple[float, float, float, float]] = None,
+) -> trimesh.Trimesh:
+    """
+    Inputs:
+    - `z_top`: 2D grid of top-surface Z values in mm.
+    - `mm_per_px_x`, `mm_per_px_y`: physical XY spacing per grid sample.
+    - `origin_x_mm`, `origin_y_mm`: XY offset for cropped local meshes.
+    - `z_bottom_mm`: flat bottom plane of the solid.
+    - `bottom_core_rect_mm`: optional XY rectangle whose flat bottom is filled
+      with star triangles instead of the full grid triangulation.
+
+    Outputs:
+    - Returns one watertight solid mesh in mm coordinates.
+    """
+    h, w = z_top.shape
+
     # Create grid of X, Y in mm
     x_idx = np.arange(w)
     y_idx = np.arange(h)
@@ -1807,7 +1958,7 @@ def generate_full_mesh(
     y_mm = origin_y_mm + (yv * mm_per_px_y)
     
     # Vertices (H*W, 3)
-    vertices_top = np.column_stack((x_mm.ravel(), y_mm.ravel(), z_values.ravel()))
+    vertices_top = np.column_stack((x_mm.ravel(), y_mm.ravel(), z_top.ravel()))
     
     # Create faces for the grid
     # Quads: (r, c), (r, c+1), (r+1, c+1), (r+1, c)
@@ -1831,9 +1982,9 @@ def generate_full_mesh(
     f2 = np.stack((v00, v01, v11), axis=-1).reshape(-1, 3)
     faces_top = np.vstack((f1, f2))
     
-    # Create solid block: Add bottom vertices at Z=0
+    # Create solid block: add bottom vertices on the flat bottom plane
     vertices_bottom = vertices_top.copy()
-    vertices_bottom[:, 2] = 0.0
+    vertices_bottom[:, 2] = float(z_bottom_mm)
     
     # Offset for bottom vertices
     offset = h * w
@@ -1861,6 +2012,7 @@ def generate_full_mesh(
             float(mm_per_px_x),
             float(mm_per_px_y),
             bottom_core_rect_mm,
+            z_bottom_mm=float(z_bottom_mm),
         )
         f3 = f3_grid[~core_cell_mask].reshape(-1, 3)
         f4 = f4_grid[~core_cell_mask].reshape(-1, 3)
@@ -1928,6 +2080,32 @@ def generate_full_mesh(
     return mesh
 
 
+def _largest_valid_polygon(poly: Polygon) -> Polygon:
+    """Repair a possibly self-intersecting polygon and keep its largest piece."""
+    if poly.is_valid:
+        return poly
+    repaired = poly.buffer(0)
+    if repaired.is_empty:
+        raise ValueError("Boundary polygon could not be repaired")
+    if repaired.geom_type == "Polygon":
+        return repaired
+    if hasattr(repaired, "geoms"):
+        polys = [g for g in repaired.geoms if g.geom_type == "Polygon"]
+        if not polys:
+            raise ValueError("Boundary repair did not produce a polygon")
+        return max(polys, key=lambda p: p.area)
+    raise ValueError("Boundary repair produced unsupported geometry")
+
+
+def _band_polygon(line_a: np.ndarray, line_b: np.ndarray) -> Polygon:
+    """Close two opposing boundary polylines into a single repaired band polygon."""
+    ring = np.vstack([
+        np.asarray(line_a, dtype=float),
+        np.asarray(line_b, dtype=float)[::-1],
+    ])
+    return _largest_valid_polygon(Polygon(ring))
+
+
 def create_extruded_tool(
     boundary_points: np.ndarray,
     z_min: float,
@@ -1945,20 +2123,7 @@ def create_extruded_tool(
     if not np.allclose(boundary_points[0], boundary_points[-1]):
         boundary_points = np.vstack([boundary_points, boundary_points[0]])
 
-    poly = Polygon(boundary_points)
-    if not poly.is_valid:
-        repaired = poly.buffer(0)
-        if repaired.is_empty:
-            raise ValueError("Boundary polygon could not be repaired")
-        if repaired.geom_type == "Polygon":
-            poly = repaired
-        elif hasattr(repaired, "geoms"):
-            polys = [g for g in repaired.geoms if g.geom_type == "Polygon"]
-            if not polys:
-                raise ValueError("Boundary repair did not produce a polygon")
-            poly = max(polys, key=lambda p: p.area)
-        else:
-            raise ValueError("Boundary repair produced unsupported geometry")
+    poly = _largest_valid_polygon(Polygon(boundary_points))
     # Simplify slightly to reduce vertex count if needed, but separating lines are critical
     # poly = poly.simplify(0.1, preserve_topology=True) 
     
@@ -1970,6 +2135,525 @@ def create_extruded_tool(
     mesh.apply_translation([0, 0, z_min])
     
     return mesh
+
+
+def relief_cap_grids(
+    z_top: np.ndarray,
+    mm_per_px_x: float,
+    mm_per_px_y: float,
+    smoothing_mm: float,
+    tight_clearance_height_mm: float,
+    extra_clearance_mm: float,
+    band_bottom_mm: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Inputs:
+    - `z_top`: top-surface Z grid in mm.
+    - `mm_per_px_x`, `mm_per_px_y`: XY spacing of that grid.
+    - `smoothing_mm`: gaussian sigma (mm) used to low-pass the top surface.
+    - `tight_clearance_height_mm`: thickness of the tight band below the top surface.
+    - `extra_clearance_mm`: how deep the pocket is cut into the wall.
+    - `band_bottom_mm`: top of the tight band at the tile bottom.
+
+    Outputs:
+    - Returns `(cap_at_wall, cap_at_pocket_wall)`: the Z the pocket ceiling reaches
+      where it meets the wall, and where it meets the pocket's vertical wall one
+      clearance further in. Sampling those two grids at the two sides of the band
+      gives the pocket's top ramp.
+
+    `cap_at_wall` is the low-passed top surface lowered by the tight clearance
+    height, clamped below the real surface so the pocket cannot break through the
+    top (a gaussian sits above the floor of a narrow valley).
+
+    `cap_at_pocket_wall` erodes that with a local minimum before dropping it by the
+    ramp height. The erosion is what makes the ramp printable: without it the ramp
+    is 45 degrees relative to the terrain, so wherever the terrain rises going
+    inwards the printed face flattens towards a ceiling. Taking a neighbourhood
+    minimum guarantees the pocket wall's ceiling sits at least one ramp height
+    below the wall's ceiling anywhere within reach, so the face stays steep.
+
+    Both grids are floored so the pocket is never shorter than
+    `MIN_POCKET_HEIGHT_MM`; where the wall is too low for two tight bands the
+    pocket degenerates to that sliver, which disappears in slicing.
+    """
+    from scipy.ndimage import gaussian_filter, minimum_filter
+
+    z = np.asarray(z_top, dtype=np.float32)
+    sigma_r = max(0.0, float(smoothing_mm) / max(1e-9, float(mm_per_px_y)))
+    sigma_c = max(0.0, float(smoothing_mm) / max(1e-9, float(mm_per_px_x)))
+    if max(sigma_r, sigma_c) > 1e-6:
+        smoothed = gaussian_filter(z, sigma=(sigma_r, sigma_c), mode="nearest")
+    else:
+        smoothed = z
+    cap = np.minimum(smoothed, z) - float(tight_clearance_height_mm)
+
+    ramp = RELIEF_RAMP_FACTOR * float(extra_clearance_mm)
+    floor_mm = float(band_bottom_mm) + 2.0 * ramp + MIN_POCKET_HEIGHT_MM
+    np.maximum(cap, np.float32(floor_mm), out=cap)
+
+    radius_mm = RELIEF_EROSION_FACTOR * float(extra_clearance_mm)
+    k_r = max(1, int(np.ceil(radius_mm / max(1e-9, float(mm_per_px_y)))))
+    k_c = max(1, int(np.ceil(radius_mm / max(1e-9, float(mm_per_px_x)))))
+    eroded = minimum_filter(cap, size=(2 * k_r + 1, 2 * k_c + 1), mode="nearest")
+    return cap, eroded - np.float32(ramp)
+
+
+def _sample_grid_bilinear(
+    grid: np.ndarray,
+    origin_x_mm: float,
+    origin_y_mm: float,
+    mm_per_px_x: float,
+    mm_per_px_y: float,
+    points_xy: np.ndarray,
+) -> np.ndarray:
+    """Bilinearly sample a raster grid at arbitrary XY points, clamped at the edges."""
+    h, w = grid.shape
+    pts = np.asarray(points_xy, dtype=float)
+    cx = np.clip((pts[:, 0] - float(origin_x_mm)) / float(mm_per_px_x), 0.0, w - 1.0)
+    ry = np.clip((pts[:, 1] - float(origin_y_mm)) / float(mm_per_px_y), 0.0, h - 1.0)
+    c0 = np.floor(cx).astype(np.int64)
+    r0 = np.floor(ry).astype(np.int64)
+    c1 = np.minimum(c0 + 1, w - 1)
+    r1 = np.minimum(r0 + 1, h - 1)
+    fc = cx - c0
+    fr = ry - r0
+    return (
+        grid[r0, c0] * (1.0 - fr) * (1.0 - fc)
+        + grid[r0, c1] * (1.0 - fr) * fc
+        + grid[r1, c0] * fr * (1.0 - fc)
+        + grid[r1, c1] * fr * fc
+    )
+
+
+def _polygon_parts(geom) -> list[Polygon]:
+    """Return the non-degenerate polygon parts of any shapely geometry."""
+    if geom is None or geom.is_empty:
+        return []
+    parts = getattr(geom, "geoms", [geom])
+    return [g for g in parts if g.geom_type == "Polygon" and g.area > 1e-9]
+
+
+def _iter_ring_coords(geom) -> list[np.ndarray]:
+    """Return every ring of a polygonal geometry as its own coordinate array."""
+    rings: list[np.ndarray] = []
+    for part in _polygon_parts(geom):
+        rings.append(np.asarray(part.exterior.coords, dtype=float))
+        rings.extend(np.asarray(ring.coords, dtype=float) for ring in part.interiors)
+    return rings
+
+
+def _densify_polyline(coords: np.ndarray, max_step_mm: float) -> np.ndarray:
+    """Resample a polyline so no segment is longer than `max_step_mm`."""
+    coords = np.asarray(coords, dtype=float)
+    if len(coords) < 2:
+        return coords
+    segments = coords[1:] - coords[:-1]
+    lengths = np.linalg.norm(segments, axis=1)
+    parts = [coords]
+    for idx in np.where(lengths > float(max_step_mm))[0]:
+        steps = int(np.ceil(lengths[idx] / float(max_step_mm)))
+        t = (np.arange(1, steps) / steps)[:, None]
+        parts.append(coords[idx] + t * segments[idx])
+    return np.vstack(parts)
+
+
+def _taper_fraction_from_outline(vertices_xy: np.ndarray, outline, taper_width_mm: float) -> np.ndarray:
+    """
+    Measure how far each vertex sits into the taper band, as a fraction of its width.
+
+    Ring membership is not enough: where the seam is narrower than twice the taper
+    an inner ring disappears locally, and every vertex of that stretch would read as
+    sitting on the wall. Measuring the real distance to the outline instead keeps
+    the ceiling sloping over those stretches.
+
+    Vertices outside the outline get 0, so the tool keeps its full height right up
+    to the wall it is cutting into.
+    """
+    import shapely
+    from scipy.spatial import cKDTree
+
+    vertices_xy = np.asarray(vertices_xy, dtype=float)
+    probes = [
+        _densify_polyline(ring, _TAPER_PROBE_STEP_MM)
+        for ring in _iter_ring_coords(outline)
+    ]
+    if not probes:
+        return np.zeros(len(vertices_xy), dtype=float)
+    distance, _ = cKDTree(np.vstack(probes)).query(vertices_xy)
+    fraction = np.clip(distance / max(1e-9, float(taper_width_mm)), 0.0, 1.0)
+    shapely.prepare(outline)
+    inside = shapely.contains_xy(outline, vertices_xy[:, 0], vertices_xy[:, 1])
+    fraction[~inside] = 0.0
+    return fraction
+
+
+def _weld_key(points_xy: np.ndarray) -> np.ndarray:
+    return np.round(np.asarray(points_xy, dtype=float) / _WELD_QUANTUM_MM).astype(np.int64)
+
+
+def _orient_faces_ccw(vertices_xy: np.ndarray, faces: np.ndarray, min_twice_area: float = 1e-9):
+    """Drop degenerate triangles and wind the rest counter-clockwise."""
+    d1 = vertices_xy[faces[:, 1]] - vertices_xy[faces[:, 0]]
+    d2 = vertices_xy[faces[:, 2]] - vertices_xy[faces[:, 0]]
+    twice_area = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+    faces = faces[np.abs(twice_area) > min_twice_area]
+    twice_area = twice_area[np.abs(twice_area) > min_twice_area]
+    if len(faces) == 0:
+        return faces
+    faces = np.array(faces, copy=True)
+    faces[twice_area < 0.0] = faces[twice_area < 0.0][:, ::-1]
+    return faces
+
+
+def _split_pinch_vertices(vertices_xy: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Duplicate every vertex whose incident triangles form more than one fan.
+
+    Where a taper band pinches out, the domain boundary touches itself. A wall
+    raised on such a vertex is shared by four quads instead of two, which is not a
+    closed solid and gets rejected by the boolean engine. Giving each fan its own
+    copy, nudged a micron into that fan, keeps every edge used exactly twice.
+
+    Returns the new vertices, the remapped faces, and the source index of each
+    vertex so per-vertex fields can be carried across.
+    """
+    original = np.asarray(faces, dtype=np.int64)
+    faces = np.array(original, copy=True)
+    count = len(vertices_xy)
+
+    corner_vertex = original.reshape(-1)
+    corner_face = np.repeat(np.arange(len(original), dtype=np.int64), 3)
+    order = np.argsort(corner_vertex, kind="stable")
+    corner_vertex = corner_vertex[order]
+    corner_face = corner_face[order]
+    starts = np.searchsorted(corner_vertex, np.arange(count))
+    ends = np.searchsorted(corner_vertex, np.arange(count), side="right")
+
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    for face_index, tri in enumerate(original):
+        for u, w in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+            edge_faces.setdefault((u, w) if u < w else (w, u), []).append(face_index)
+
+    source = list(range(count))
+    extra_xy: list[np.ndarray] = []
+    for vertex in range(count):
+        incident = corner_face[starts[vertex]:ends[vertex]]
+        if len(incident) < 2:
+            continue
+        parent = {int(f): int(f) for f in incident}
+
+        def find(node: int) -> int:
+            while parent[node] != node:
+                parent[node] = parent[parent[node]]
+                node = parent[node]
+            return node
+
+        for face_index in incident:
+            tri = original[face_index]
+            for u, w in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+                if u != vertex and w != vertex:
+                    continue
+                for other in edge_faces[(u, w) if u < w else (w, u)]:
+                    if other in parent:
+                        left, right = find(int(face_index)), find(int(other))
+                        if left != right:
+                            parent[left] = right
+        fans: dict[int, list[int]] = {}
+        for face_index in incident:
+            fans.setdefault(find(int(face_index)), []).append(int(face_index))
+        if len(fans) < 2:
+            continue
+        for fan_index, members in enumerate(fans.values()):
+            if fan_index == 0:
+                continue
+            new_index = count + len(extra_xy)
+            centre = vertices_xy[original[members].reshape(-1)].mean(axis=0)
+            direction = centre - vertices_xy[vertex]
+            distance = float(np.linalg.norm(direction))
+            step = direction / distance * _PINCH_NUDGE_MM if distance > 1e-12 else np.zeros(2)
+            extra_xy.append(vertices_xy[vertex] + step)
+            source.append(vertex)
+            for face_index in members:
+                corner = int(np.flatnonzero(original[face_index] == vertex)[0])
+                faces[face_index, corner] = new_index
+
+    if not extra_xy:
+        return vertices_xy, faces, np.arange(count)
+    return np.vstack([vertices_xy, np.array(extra_xy)]), faces, np.array(source)
+
+
+def _subdivide_domain(vertices_xy: np.ndarray, faces: np.ndarray, rounds: int) -> tuple[np.ndarray, np.ndarray]:
+    """Split every triangle into four, leaving the domain boundary where it is."""
+    for _ in range(max(0, int(rounds))):
+        edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+        unique, inverse = np.unique(np.sort(edges, axis=1), axis=0, return_inverse=True)
+        midpoints = 0.5 * (vertices_xy[unique[:, 0]] + vertices_xy[unique[:, 1]])
+        mid = inverse.reshape(3, -1).T + len(vertices_xy)
+        v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
+        m01, m12, m20 = mid[:, 0], mid[:, 1], mid[:, 2]
+        faces = np.vstack([
+            np.column_stack((v0, m01, m20)),
+            np.column_stack((m01, v1, m12)),
+            np.column_stack((m20, m12, v2)),
+            np.column_stack((m01, m12, m20)),
+        ])
+        vertices_xy = np.vstack([vertices_xy, midpoints])
+    return vertices_xy, faces
+
+
+def build_taper_domain(
+    outer: Polygon,
+    outline,
+    taper_width_mm: float,
+    ring_count: int = TAPER_RING_COUNT,
+) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Inputs:
+    - `outer`: region reaching past the tile, so the tool cannot end flush with a wall.
+    - `outline`: the wall the taper is measured from.
+    - `taper_width_mm`: how far the taper reaches in from that wall.
+    - `ring_count`: how many nested rings the band is split into.
+
+    Outputs:
+    - Returns `(vertices_xy, faces, fraction)`: one welded triangulation of
+      `outer - outline` plus the band between `outline` and its innermost ring.
+      `fraction` is 0 on and outside `outline` and rises to 1 at the taper width,
+      so a height field that is linear in the fraction becomes a ruled ramp.
+    - Returns `None` when there is nothing to taper.
+
+    Every patch is triangulated on its own (an earcut hole cannot carry an interior
+    ring) and the patches are then welded along the rings they share. Earcut adds no
+    vertices, so their edges along a shared ring match exactly.
+    """
+    width = float(taper_width_mm)
+    if width <= 0.0:
+        return None
+
+    patches: list[Polygon] = _polygon_parts(outer.difference(outline))
+    previous = outline
+    for step in range(1, int(ring_count) + 1):
+        ring = outline.buffer(-width * step / float(ring_count), join_style=2, mitre_limit=2.0)
+        patches.extend(_polygon_parts(previous.difference(ring)))
+        previous = ring
+        if ring.is_empty:
+            break
+    if previous.is_empty or previous.area < 0.5 * outline.area:
+        raise ValueError("Taper width eats the tile; check the taper width and outline")
+
+    verts_list: list[np.ndarray] = []
+    faces_list: list[np.ndarray] = []
+    offset = 0
+    for poly in patches:
+        patch_v, patch_f = trimesh.creation.triangulate_polygon(poly, engine="earcut")
+        if len(patch_f) == 0:
+            continue
+        verts_list.append(np.asarray(patch_v, dtype=float)[:, :2])
+        faces_list.append(np.asarray(patch_f, dtype=np.int64) + offset)
+        offset += len(patch_v)
+    if not faces_list:
+        return None
+
+    verts = np.vstack(verts_list)
+    faces = np.vstack(faces_list)
+
+    _unique, first_idx, inverse = np.unique(_weld_key(verts), axis=0, return_index=True, return_inverse=True)
+    verts = verts[first_idx]
+    faces = inverse.reshape(-1)[faces]
+
+    faces = _orient_faces_ccw(verts, faces)
+    if len(faces) == 0:
+        return None
+    verts, faces, _source = _split_pinch_vertices(verts, faces)
+    # The nudge in the split can invert a sliver, so wind the faces again.
+    faces = _orient_faces_ccw(verts, faces)
+    if len(faces) == 0:
+        return None
+
+    verts, faces = _subdivide_domain(verts, faces, TAPER_SUBDIVISIONS)
+    fraction = _taper_fraction_from_outline(verts, outline, width)
+    return verts, faces, fraction
+
+
+def build_solid_from_domain(
+    vertices_xy: np.ndarray,
+    faces: np.ndarray,
+    z_bottom: np.ndarray,
+    z_top: np.ndarray,
+) -> trimesh.Trimesh:
+    """
+    Inputs:
+    - `vertices_xy`: (N, 2) domain vertices.
+    - `faces`: (M, 3) counter-clockwise triangles over those vertices.
+    - `z_bottom`, `z_top`: per-vertex bottom and top Z in mm, with `z_top >= z_bottom`.
+
+    Outputs:
+    - Returns the closed solid between the two height fields. Because both fields
+      are linear per triangle, `z_top >= z_bottom` at the vertices keeps the solid
+      free of self-intersections inside every triangle as well.
+    """
+    n = len(vertices_xy)
+    vertices = np.vstack([
+        np.column_stack((vertices_xy, np.asarray(z_top, dtype=float))),
+        np.column_stack((vertices_xy, np.asarray(z_bottom, dtype=float))),
+    ])
+
+    # Walls close the solid along every edge that only one triangle uses.
+    edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    _unique, first_idx, counts = np.unique(np.sort(edges, axis=1), axis=0, return_index=True, return_counts=True)
+    border = edges[first_idx[counts == 1]]
+    a = border[:, 0]
+    b = border[:, 1]
+    walls = np.vstack([
+        np.column_stack((a, a + n, b + n)),
+        np.column_stack((a, b + n, b)),
+    ])
+
+    # process=False on purpose: merging vertices here would undo the pinch split
+    # that keeps this a closed solid.
+    mesh = trimesh.Trimesh(
+        vertices=vertices,
+        faces=np.vstack([faces, faces[:, ::-1] + n, walls]),
+        process=False,
+    )
+    if not mesh.is_volume:
+        mesh.fix_normals()
+    return mesh
+
+
+def _taper_box(tile_bounds_xy: tuple[float, float, float, float], box_pad_mm: float) -> Polygon:
+    x0, y0, x1, y1 = (float(v) for v in tile_bounds_xy)
+    pad = float(box_pad_mm)
+    return Polygon([
+        (x0 - pad, y0 - pad),
+        (x1 + pad, y0 - pad),
+        (x1 + pad, y1 + pad),
+        (x0 - pad, y1 + pad),
+    ])
+
+
+def _outline_polygon(outline_lines: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]):
+    """Close a tile's four boundary polylines into its footprint (possibly multi-part)."""
+    top_line, bot_line, left_line, right_line = outline_lines
+    return _band_polygon(top_line, bot_line).intersection(_band_polygon(left_line, right_line))
+
+
+def build_relief_cut_tool(
+    cap_at_wall: np.ndarray,
+    cap_at_pocket_wall: np.ndarray,
+    mm_per_px_x: float,
+    mm_per_px_y: float,
+    origin_x_mm: float,
+    origin_y_mm: float,
+    tile_bounds_xy: tuple[float, float, float, float],
+    outline_lines: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    extra_clearance_mm: float,
+    band_bottom_mm: float,
+    box_pad_mm: float = 2.0,
+) -> Optional[trimesh.Trimesh]:
+    """
+    Inputs:
+    - `cap_at_wall`, `cap_at_pocket_wall`: the two ceiling grids from `relief_cap_grids`.
+    - `mm_per_px_x`, `mm_per_px_y`, `origin_x_mm`, `origin_y_mm`: crop georeferencing.
+    - `tile_bounds_xy`: `(x0, y0, x1, y1)` XY extent of the already cut tile.
+    - `outline_lines`: the tile's top/bottom/left/right walls. Map-border edges must
+      be passed as lines lying outside the map so their walls stay tight.
+    - `extra_clearance_mm`: how deep the pocket is cut into each mating wall.
+    - `band_bottom_mm`: top of the tight band at the tile bottom.
+    - `box_pad_mm`: how far the tool reaches beyond the tile outline.
+
+    Outputs:
+    - Returns the solid to subtract so the mating walls are set back by the extra
+      clearance between the two tight bands, or `None` when there is nothing to
+      relieve.
+
+    The pocket's vertical wall starts above the tight band and stops below the cap,
+    and both gaps are closed with ramps steeper than the 45 degree overhang limit.
+    So the pocket prints without support and has no sharp inner corner at its base.
+    """
+    extra = float(extra_clearance_mm)
+    if extra <= 0.0:
+        return None
+
+    outline = _outline_polygon(outline_lines)
+    if outline.is_empty:
+        return None
+    box = _taper_box(tile_bounds_xy, box_pad_mm)
+    # Guard against a mismatched outline: the pocket must be a thin rim, so the
+    # outline has to cover nearly all of the tile.
+    if outline.intersection(box).area < 0.5 * box.area:
+        raise ValueError("Relief outline does not cover the tile; check the offset lines")
+
+    domain = build_taper_domain(box, outline, extra)
+    if domain is None:
+        return None
+    vertices, faces, fraction = domain
+
+    # Fraction 0 sits on the wall, where the pocket has no depth and spans the full
+    # band; fraction 1 sits on the pocket wall, one clearance further in and one
+    # ramp height shorter at each end.
+    z_bottom = float(band_bottom_mm) + RELIEF_RAMP_FACTOR * extra * fraction
+    sample = dict(
+        origin_x_mm=origin_x_mm,
+        origin_y_mm=origin_y_mm,
+        mm_per_px_x=mm_per_px_x,
+        mm_per_px_y=mm_per_px_y,
+        points_xy=vertices,
+    )
+    ceiling_wall = _sample_grid_bilinear(cap_at_wall, **sample)
+    ceiling_pocket = _sample_grid_bilinear(cap_at_pocket_wall, **sample)
+    z_top = ceiling_wall * (1.0 - fraction) + ceiling_pocket * fraction
+
+    tool = build_solid_from_domain(vertices, faces, z_bottom, z_top)
+    if not tool.is_volume:
+        raise ValueError("Relief cut tool is not a closed solid")
+    return tool
+
+
+def build_bottom_chamfer_tool(
+    tile_bounds_xy: tuple[float, float, float, float],
+    outline_lines: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    chamfer_width_mm: float,
+    box_pad_mm: float = 2.0,
+) -> Optional[trimesh.Trimesh]:
+    """
+    Inputs:
+    - `tile_bounds_xy`: `(x0, y0, x1, y1)` XY extent of the already cut tile.
+    - `outline_lines`: the tile's top/bottom/left/right walls, all at their true
+      positions so the chamfer runs around the whole bottom edge.
+    - `chamfer_width_mm`: how far the chamfer reaches in from the wall at the very
+      bottom. Its height is `CHAMFER_SLOPE` times that, so the face clears 45 degrees.
+    - `box_pad_mm`: how far the tool reaches beyond the tile outline.
+
+    Outputs:
+    - Returns the wedge to subtract from the tile bottom edge, or `None` when no
+      chamfer was asked for.
+
+    The taper runs slightly past the chamfer width so the cut crosses the tile's
+    bottom plane instead of touching it, which keeps the boolean clean.
+    """
+    width = float(chamfer_width_mm)
+    if width <= 0.0:
+        return None
+
+    outline = _outline_polygon(outline_lines)
+    if outline.is_empty:
+        return None
+    box = _taper_box(tile_bounds_xy, box_pad_mm)
+    if outline.intersection(box).area < 0.5 * box.area:
+        raise ValueError("Chamfer outline does not cover the tile; check the offset lines")
+
+    domain = build_taper_domain(box, outline, CHAMFER_OVERRUN * width)
+    if domain is None:
+        return None
+    vertices, faces, fraction = domain
+
+    z_bottom = np.full(len(vertices), -max(1.0, width), dtype=float)
+    z_top = CHAMFER_SLOPE * width * (1.0 - CHAMFER_OVERRUN * fraction)
+
+    tool = build_solid_from_domain(vertices, faces, z_bottom, z_top)
+    if not tool.is_volume:
+        raise ValueError("Bottom chamfer tool is not a closed solid")
+    return tool
 
 
 def offset_polyline(points: np.ndarray, dist: float, constrain_axis: int = None) -> np.ndarray:
@@ -2108,6 +2792,31 @@ def _flip_mesh_across_x_axis(mesh: trimesh.Trimesh, total_height_mm: float) -> t
     mesh.apply_scale([1.0, -1.0, 1.0])
     mesh.apply_translation([0.0, float(total_height_mm), 0.0])
     return mesh
+
+
+def drop_boolean_scraps(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, int, float]:
+    """
+    Inputs:
+    - `mesh`: the result of a boolean, which may carry disconnected debris.
+
+    Outputs:
+    - Returns `(cleaned, dropped_count, dropped_area_mm2)`.
+
+    Cutting a fine tool out of a much coarser terrain mesh leaves behind sub-
+    millimetre shells along the cut. They hold no volume and no slicer can print
+    them, but they make the result read as many bodies, so drop them. Anything
+    larger than `SCRAP_AREA_MM2` is kept, so a tile that genuinely falls into
+    several pieces survives and stays visible to the caller.
+    """
+    parts = mesh.split(only_watertight=False)
+    if len(parts) <= 1:
+        return mesh, 0, 0.0
+    keep = [part for part in parts if part.area >= SCRAP_AREA_MM2]
+    dropped = [part for part in parts if part.area < SCRAP_AREA_MM2]
+    if not keep or not dropped:
+        return mesh, 0, 0.0
+    cleaned = keep[0] if len(keep) == 1 else trimesh.util.concatenate(keep)
+    return cleaned, len(dropped), float(sum(part.area for part in dropped))
 
 
 def _empty_mesh_for_tile(tx: int, ty: int) -> trimesh.Trimesh:
@@ -2311,6 +3020,14 @@ def _effective_nozzle_diameter_mm(args) -> float:
 
 def _effective_fitting_clearance_mm(args) -> float:
     return float(args.fitting_clearance) / _effective_print_scale(args)
+
+
+def _effective_extra_clearance_mm(args) -> float:
+    return float(args.extra_clearance_mm) / _effective_print_scale(args)
+
+
+def _effective_chamfer_width_mm(args) -> float:
+    return float(args.chamfer_width_mm) / _effective_print_scale(args)
 
 
 def load_raster_context(args, log: logging.Logger) -> RasterContext:
@@ -3159,92 +3876,169 @@ def _parse_export_tile_selection(export_meshes: Optional[list[str]], nx: int, ny
     return selected
 
 
-def _worker_export_tile_mesh(args):
+def _worker_export_tile_mesh(task: dict):
     """
     Inputs:
-    - Serialized tile export task arguments, including one DEM crop and the
-      neighboring cutline geometry needed to isolate a single tile.
+    - One serialized tile export task: the DEM crop bounds plus the neighboring
+      cutline geometry needed to isolate and relieve a single tile.
 
     Outputs:
     - Returns a small status dict describing a successful export, empty result,
       or failure for one tile.
     """
-    (
-        tx,
-        ty,
-        out_path,
-        mmap_path,
-        shape,
-        dtype_str,
-        crop_x0_px,
-        crop_x1_px,
-        crop_y0_px,
-        crop_y1_px,
-        mm_per_px_x,
-        mm_per_px_y,
-        bottom_thickness_mm,
-        desired_height_mm,
-        height_exponent,
-        norm_h_min,
-        norm_h_max,
-        total_height_mm,
-        print_scale,
-        z_min,
-        z_max,
-        top_line,
-        bot_line,
-        left_line,
-        right_line,
-        bottom_core_rect,
-        stencil_stl_path,
-    ) = args
-
+    tx = int(task["tx"])
+    ty = int(task["ty"])
     t0 = time.perf_counter()
-    elev_map = np.memmap(mmap_path, dtype=np.dtype(dtype_str), mode="r", shape=shape)
-    crop = elev_map[crop_y0_px:crop_y1_px, crop_x0_px:crop_x1_px]
+
+    elev_map = np.memmap(
+        task["mmap_path"],
+        dtype=np.dtype(task["dtype_str"]),
+        mode="r",
+        shape=task["shape"],
+    )
+    crop = elev_map[
+        int(task["crop_y0_px"]):int(task["crop_y1_px"]),
+        int(task["crop_x0_px"]):int(task["crop_x1_px"]),
+    ]
     if crop.shape[0] < 2 or crop.shape[1] < 2:
         return {"status": "error", "tx": tx, "ty": ty, "error": f"crop too small: {crop.shape}"}
 
+    mm_per_px_x = float(task["mm_per_px_x"])
+    mm_per_px_y = float(task["mm_per_px_y"])
+    origin_x_mm = float(task["crop_x0_px"]) * mm_per_px_x
+    origin_y_mm = float(task["crop_y0_px"]) * mm_per_px_y
+    z_min = float(task["z_min"])
+    z_max = float(task["z_max"])
+    tight_height_mm = float(task["tight_clearance_height_mm"])
+    extra_clearance_mm = float(task["extra_clearance_mm"])
+    chamfer_width_mm = float(task["chamfer_width_mm"])
+
     try:
-        local_mesh = generate_full_mesh(
+        z_top = _top_z_grid_from_elevation(
             crop,
-            mm_per_px_x=float(mm_per_px_x),
-            mm_per_px_y=float(mm_per_px_y),
-            bottom_thickness_mm=float(bottom_thickness_mm),
-            desired_height_mm=float(desired_height_mm),
-            height_exponent=float(height_exponent),
-            norm_h_min=float(norm_h_min),
-            norm_h_max=float(norm_h_max),
-            origin_x_mm=float(crop_x0_px) * float(mm_per_px_x),
-            origin_y_mm=float(crop_y0_px) * float(mm_per_px_y),
-            bottom_core_rect_mm=bottom_core_rect,
+            bottom_thickness_mm=float(task["bottom_thickness_mm"]),
+            desired_height_mm=float(task["desired_height_mm"]),
+            height_exponent=float(task["height_exponent"]),
+            norm_h_min=float(task["norm_h_min"]),
+            norm_h_max=float(task["norm_h_max"]),
+        )
+        local_mesh = build_solid_from_top_z(
+            z_top,
+            mm_per_px_x=mm_per_px_x,
+            mm_per_px_y=mm_per_px_y,
+            origin_x_mm=origin_x_mm,
+            origin_y_mm=origin_y_mm,
+            bottom_core_rect_mm=task["bottom_core_rect"],
         )
         # Cut sequentially: first isolate the requested horizontal strip, then
         # isolate the matching column strip inside that slice.
-        row_tool = create_extruded_tool(np.vstack([top_line, bot_line[::-1]]), float(z_min), float(z_max))
+        row_tool = create_extruded_tool(
+            np.vstack([task["top_line"], task["bot_line"][::-1]]), z_min, z_max
+        )
         row_slice = _mesh_intersection(local_mesh, row_tool, preferred_engine="manifold")
         if row_slice.is_empty:
             return {"status": "empty", "tx": tx, "ty": ty}
 
-        col_tool = create_extruded_tool(np.vstack([left_line, right_line[::-1]]), float(z_min), float(z_max))
+        col_tool = create_extruded_tool(
+            np.vstack([task["left_line"], task["right_line"][::-1]]), z_min, z_max
+        )
         tile_mesh = _mesh_intersection(row_slice, col_tool, preferred_engine="manifold")
         if tile_mesh.is_empty:
             return {"status": "empty", "tx": tx, "ty": ty}
 
-        tile_mesh = _flip_mesh_across_x_axis(tile_mesh, float(total_height_mm))
-        if abs(float(print_scale) - 1.0) > 1e-9:
-            tile_mesh.apply_scale([float(print_scale), float(print_scale), float(print_scale)])
-        if str(stencil_stl_path).strip():
-            stencil_mesh = _load_stencil_mesh(str(stencil_stl_path))
+        # Set the mating walls back between the bottom and top tight bands so
+        # neighboring tiles only rub on those two bands during assembly, and
+        # chamfer the bottom edge. Both tools are disjoint in Z, so they can be
+        # handed to one boolean.
+        tile_bounds_xy = (
+            float(tile_mesh.bounds[0][0]),
+            float(tile_mesh.bounds[0][1]),
+            float(tile_mesh.bounds[1][0]),
+            float(tile_mesh.bounds[1][1]),
+        )
+        wall_lines = (
+            task["top_line"],
+            task["bot_line"],
+            task["left_line"],
+            task["right_line"],
+        )
+        relief_mm = 0.0
+        chamfer_mm = 0.0
+        tools = []
+        if extra_clearance_mm > 1e-9 and tight_height_mm > 1e-9:
+            cap_at_wall, cap_at_pocket_wall = relief_cap_grids(
+                z_top,
+                mm_per_px_x=mm_per_px_x,
+                mm_per_px_y=mm_per_px_y,
+                smoothing_mm=float(task["relief_smoothing_mm"]),
+                tight_clearance_height_mm=tight_height_mm,
+                extra_clearance_mm=extra_clearance_mm,
+                band_bottom_mm=tight_height_mm,
+            )
+            relief_tool = build_relief_cut_tool(
+                cap_at_wall,
+                cap_at_pocket_wall,
+                mm_per_px_x=mm_per_px_x,
+                mm_per_px_y=mm_per_px_y,
+                origin_x_mm=origin_x_mm,
+                origin_y_mm=origin_y_mm,
+                tile_bounds_xy=tile_bounds_xy,
+                outline_lines=(
+                    task["relief_top_line"],
+                    task["relief_bot_line"],
+                    task["relief_left_line"],
+                    task["relief_right_line"],
+                ),
+                extra_clearance_mm=extra_clearance_mm,
+                band_bottom_mm=tight_height_mm,
+            )
+            if relief_tool is not None and not relief_tool.is_empty:
+                tools.append(relief_tool)
+                relief_mm = extra_clearance_mm
+        if chamfer_width_mm > 1e-9:
+            chamfer_tool = build_bottom_chamfer_tool(
+                tile_bounds_xy=tile_bounds_xy,
+                outline_lines=wall_lines,
+                chamfer_width_mm=chamfer_width_mm,
+            )
+            if chamfer_tool is not None and not chamfer_tool.is_empty:
+                tools.append(chamfer_tool)
+                chamfer_mm = chamfer_width_mm
+        if tools:
+            tool = tools[0] if len(tools) == 1 else trimesh.util.concatenate(tools)
+            cut = _mesh_difference(tile_mesh, tool, preferred_engine="manifold")
+            if cut is None or cut.is_empty:
+                return {
+                    "status": "error",
+                    "tx": tx,
+                    "ty": ty,
+                    "error": "relief or chamfer cut produced an empty tile",
+                }
+            tile_mesh = cut
+
+        tile_mesh = _flip_mesh_across_x_axis(tile_mesh, float(task["total_height_mm"]))
+        print_scale = float(task["print_scale"])
+        if abs(print_scale - 1.0) > 1e-9:
+            tile_mesh.apply_scale([print_scale, print_scale, print_scale])
+        stencil_stl_path = str(task["stencil_stl_path"]).strip()
+        if stencil_stl_path:
+            stencil_mesh = _load_stencil_mesh(stencil_stl_path)
             tile_mesh = _mesh_difference(tile_mesh, stencil_mesh, preferred_engine="manifold")
             if tile_mesh.is_empty:
                 return {"status": "empty", "tx": tx, "ty": ty}
-        tile_mesh.export(str(out_path))
+        tile_mesh, scrap_count, scrap_area = drop_boolean_scraps(tile_mesh)
+        out_path = str(task["out_path"])
+        tile_mesh.export(out_path)
         return {
             "status": "ok",
             "tx": tx,
             "ty": ty,
-            "path": str(out_path),
+            "path": out_path,
+            "relief_mm": float(relief_mm),
+            "chamfer_mm": float(chamfer_mm),
+            "scrap_count": int(scrap_count),
+            "scrap_area": float(scrap_area),
+            "bodies": int(tile_mesh.body_count),
             "t_sec": float(time.perf_counter() - t0),
         }
     except Exception as exc:
@@ -3316,7 +4110,15 @@ def export_tile_meshes(
             f"Cannot export meshes because corridor lines are missing: cols={missing_cols}, rows={missing_rows}"
         )
 
-    tasks = []
+    tight_clearance_height_mm = float(args.tight_clearance_height_mm)
+    # Relief is only cut into shared walls, so map-border edges are described by
+    # lines lying outside the map and stay tight over their full height.
+    border_x0 = -RELIEF_BORDER_PAD_MM
+    border_y0 = -RELIEF_BORDER_PAD_MM
+    border_x1 = float(ctx.eff_width_mm) + RELIEF_BORDER_PAD_MM
+    border_y1 = float(ctx.eff_height_mm) + RELIEF_BORDER_PAD_MM
+
+    tasks: list[dict] = []
     for ty in range(ny):
         top_line = (
             np.array([[0.0, 0.0], [float(ctx.eff_width_mm), 0.0]], dtype=float)
@@ -3327,6 +4129,16 @@ def export_tile_meshes(
             np.array([[0.0, float(ctx.eff_height_mm)], [float(ctx.eff_width_mm), float(ctx.eff_height_mm)]], dtype=float)
             if ty == ny - 1
             else offset_polyline(row_lines[ty + 1], half_clearance, constrain_axis=0)
+        )
+        relief_top_line = (
+            np.array([[border_x0, border_y0], [border_x1, border_y0]], dtype=float)
+            if ty == 0
+            else top_line
+        )
+        relief_bot_line = (
+            np.array([[border_x0, border_y1], [border_x1, border_y1]], dtype=float)
+            if ty == ny - 1
+            else bot_line
         )
         for tx in range(nx):
             if selected_tiles is not None and (tx, ty) not in selected_tiles:
@@ -3341,40 +4153,58 @@ def export_tile_meshes(
                 if tx == nx - 1
                 else offset_polyline(col_lines[tx + 1], -half_clearance, constrain_axis=1)
             )
+            relief_left_line = (
+                np.array([[border_x0, border_y0], [border_x0, border_y1]], dtype=float)
+                if tx == 0
+                else left_line
+            )
+            relief_right_line = (
+                np.array([[border_x1, border_y0], [border_x1, border_y1]], dtype=float)
+                if tx == nx - 1
+                else right_line
+            )
             tile_bounds_mm = _tile_bounds_mm(ctx, args, col_starts_mm, row_starts_mm, tx, ty)
             crop_x0_px, crop_x1_px, crop_y0_px, crop_y1_px = _tile_crop_bounds_px(ctx, args, tile_bounds_mm)
             bottom_core_rect = _tile_bottom_core_rect_mm(args, tile_bounds_mm, tx, ty, nx, ny)
             out_path = out_dir / f"tile_{ty:02d}_{tx:02d}.stl"
             tasks.append(
-                (
-                    tx,
-                    ty,
-                    str(out_path),
-                    None,
-                    None,
-                    str(ctx.elev_map.dtype),
-                    crop_x0_px,
-                    crop_x1_px,
-                    crop_y0_px,
-                    crop_y1_px,
-                    float(ctx.mm_per_px_x),
-                    float(ctx.mm_per_px_y),
-                    float(args.bottom_thickness_mm),
-                    float(args.desired_height_mm),
-                    float(args.height_exponent),
-                    float(global_h_min),
-                    float(global_h_max),
-                    float(ctx.eff_height_mm),
-                    _effective_print_scale(args),
-                    float(z_min),
-                    float(z_max),
-                    np.asarray(top_line, dtype=np.float32),
-                    np.asarray(bot_line, dtype=np.float32),
-                    np.asarray(left_line, dtype=np.float32),
-                    np.asarray(right_line, dtype=np.float32),
-                    bottom_core_rect,
-                    stencil_stl_path,
-                )
+                {
+                    "tx": int(tx),
+                    "ty": int(ty),
+                    "out_path": str(out_path),
+                    "mmap_path": None,
+                    "shape": None,
+                    "dtype_str": str(ctx.elev_map.dtype),
+                    "crop_x0_px": int(crop_x0_px),
+                    "crop_x1_px": int(crop_x1_px),
+                    "crop_y0_px": int(crop_y0_px),
+                    "crop_y1_px": int(crop_y1_px),
+                    "mm_per_px_x": float(ctx.mm_per_px_x),
+                    "mm_per_px_y": float(ctx.mm_per_px_y),
+                    "bottom_thickness_mm": float(args.bottom_thickness_mm),
+                    "desired_height_mm": float(args.desired_height_mm),
+                    "height_exponent": float(args.height_exponent),
+                    "norm_h_min": float(global_h_min),
+                    "norm_h_max": float(global_h_max),
+                    "total_height_mm": float(ctx.eff_height_mm),
+                    "print_scale": _effective_print_scale(args),
+                    "z_min": float(z_min),
+                    "z_max": float(z_max),
+                    "top_line": np.asarray(top_line, dtype=np.float32),
+                    "bot_line": np.asarray(bot_line, dtype=np.float32),
+                    "left_line": np.asarray(left_line, dtype=np.float32),
+                    "right_line": np.asarray(right_line, dtype=np.float32),
+                    "relief_top_line": np.asarray(relief_top_line, dtype=np.float32),
+                    "relief_bot_line": np.asarray(relief_bot_line, dtype=np.float32),
+                    "relief_left_line": np.asarray(relief_left_line, dtype=np.float32),
+                    "relief_right_line": np.asarray(relief_right_line, dtype=np.float32),
+                    "tight_clearance_height_mm": tight_clearance_height_mm,
+                    "extra_clearance_mm": _effective_extra_clearance_mm(args),
+                    "chamfer_width_mm": _effective_chamfer_width_mm(args),
+                    "relief_smoothing_mm": float(args.relief_smoothing_mm),
+                    "bottom_core_rect": bottom_core_rect,
+                    "stencil_stl_path": stencil_stl_path,
+                }
             )
 
     export_workers = max(1, min(int(args.mesh_export_workers), len(tasks)))
@@ -3384,6 +4214,16 @@ def export_tile_meshes(
         chosen = ", ".join(f"{ty:02d}_{tx:02d}" for tx, ty in sorted(selected_tiles, key=lambda item: (item[1], item[0])))
         log.info("exporting selected tiles: %s", chosen)
     log.info("export tiles via local crops: %d tasks, workers=%d", len(tasks), export_workers)
+    log.info(
+        "wall fit: tight gap %.3fmm over %.2fmm at the bottom and below the low-passed top, "
+        "relieved gap %.3fmm in between via a pocket with 45deg ramps (smoothing sigma %.2fmm), "
+        "bottom chamfer %.2fmm",
+        _effective_fitting_clearance_mm(args),
+        tight_clearance_height_mm,
+        _effective_fitting_clearance_mm(args) + 2.0 * _effective_extra_clearance_mm(args),
+        float(args.relief_smoothing_mm),
+        _effective_chamfer_width_mm(args),
+    )
     if not tasks:
         log.warning("No tile export tasks were generated")
         return
@@ -3397,81 +4237,37 @@ def export_tile_meshes(
         del mm
 
     try:
-        job_args = [
-            (
-                tx,
-                ty,
-                out_path,
-                mmap_path,
-                ctx.elev_map.shape,
-                str(ctx.elev_map.dtype),
-                crop_x0_px,
-                crop_x1_px,
-                crop_y0_px,
-                crop_y1_px,
-                mm_per_px_x,
-                mm_per_px_y,
-                bottom_thickness_mm,
-                desired_height_mm,
-                height_exponent,
-                norm_h_min,
-                norm_h_max,
-                total_height_mm,
-                print_scale,
-                z_min,
-                z_max,
-                top_line,
-                bot_line,
-                left_line,
-                right_line,
-                bottom_core_rect,
-                stencil_stl_path,
-            )
-            for (
-                tx,
-                ty,
-                out_path,
-                _mmap_path,
-                _shape,
-                _dtype_str,
-                crop_x0_px,
-                crop_x1_px,
-                crop_y0_px,
-                crop_y1_px,
-                mm_per_px_x,
-                mm_per_px_y,
-                bottom_thickness_mm,
-                desired_height_mm,
-                height_exponent,
-                norm_h_min,
-                norm_h_max,
-                total_height_mm,
-                print_scale,
-                z_min,
-                z_max,
-                top_line,
-                bot_line,
-                left_line,
-                right_line,
-                bottom_core_rect,
-                stencil_stl_path,
-            ) in tasks
-        ]
+        for task in tasks:
+            task["mmap_path"] = mmap_path
+            task["shape"] = ctx.elev_map.shape
 
         with Timer("process tiles (boolean, multiprocessing)", log):
             ctx_mp = get_context("spawn")
             with ctx_mp.Pool(processes=export_workers) as pool:
-                it = pool.imap_unordered(_worker_export_tile_mesh, job_args, chunksize=1)
-                for result in tqdm(it, total=len(job_args), desc="Export tiles", unit="tile"):
+                it = pool.imap_unordered(_worker_export_tile_mesh, tasks, chunksize=1)
+                for result in tqdm(it, total=len(tasks), desc="Export tiles", unit="tile"):
                     status = str(result.get("status", "error"))
                     if status == "ok":
                         log.info(
-                            "Exported %s (tile %02d_%02d, %.2fs)",
+                            "Exported %s (tile %02d_%02d, %.2fs, relief %.3fmm/side, chamfer %.2fmm, "
+                            "%d bodies, dropped %d scraps totalling %.4f mm^2)",
                             result["path"],
                             int(result["ty"]),
                             int(result["tx"]),
                             float(result["t_sec"]),
+                            float(result.get("relief_mm", 0.0)),
+                            float(result.get("chamfer_mm", 0.0)),
+                            int(result.get("bodies", 1)),
+                            int(result.get("scrap_count", 0)),
+                            float(result.get("scrap_area", 0.0)),
                         )
+                        if int(result.get("bodies", 1)) > 1:
+                            log.warning(
+                                "Tile %02d_%02d is in %d separate pieces",
+                                int(result["ty"]),
+                                int(result["tx"]),
+                                int(result["bodies"]),
+                            )
                     elif status == "empty":
                         log.warning("Tile %02d_%02d produced an empty mesh", int(result["ty"]), int(result["tx"]))
                     else:
@@ -3503,6 +4299,19 @@ def main():
         raise ValueError("--height-exponent must be > 0")
     if int(args.mesh_export_workers) <= 0:
         raise ValueError("--mesh-export-workers must be > 0")
+    if float(args.tight_clearance_height_mm) < 0:
+        raise ValueError("--tight-clearance-height-mm must be >= 0")
+    if float(args.extra_clearance_mm) < 0:
+        raise ValueError("--extra-clearance-mm must be >= 0")
+    if float(args.relief_smoothing_mm) < 0:
+        raise ValueError("--relief-smoothing-mm must be >= 0")
+    if float(args.chamfer_width_mm) < 0:
+        raise ValueError("--chamfer-width-mm must be >= 0")
+    if float(args.extra_clearance_mm) > 0 and float(args.tight_clearance_height_mm) > 0:
+        if CHAMFER_SLOPE * float(args.chamfer_width_mm) >= float(args.tight_clearance_height_mm):
+            raise ValueError("--chamfer-width-mm must stay below --tight-clearance-height-mm")
+        if 2.0 * RELIEF_RAMP_FACTOR * float(args.extra_clearance_mm) >= float(args.tight_clearance_height_mm):
+            raise ValueError("--extra-clearance-mm ramps do not fit in --tight-clearance-height-mm")
     ctx = load_raster_context(args, log)
     plan = plan_tiling(ctx, args)
     workers = resolve_worker_count(args.workers)
