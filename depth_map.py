@@ -83,6 +83,16 @@ _PINCH_NUDGE_MM = 1e-3
 # rather than material. A closed shell this small cannot hold a printable volume.
 SCRAP_AREA_MM2 = 1.0
 
+# Stock name for the per-edge clearance table when a directory is given.
+ASYMMETRIC_CLEARANCE_FILENAME = "asymmetric_clearances.csv"
+
+# Field width of that table, chosen so "00_00" and " 0.10" line up in a monospace
+# editor and the tile blocks read as a grid.
+_CLEARANCE_FIELD_WIDTH = 6
+
+# The four edges of a tile, named for their direction on the assembled map.
+EDGE_NAMES = ("top", "bottom", "left", "right")
+
 # Coordinate quantum used to weld the two taper patches into one surface.
 _WELD_QUANTUM_MM = 1e-6
 
@@ -266,7 +276,7 @@ def parse_args():
     )
     ap.add_argument(
         "--fitting-clearance",
-        default=0.15,
+        default=0.2,
         type=float,
         help="Total clearance gap between tiles (mm). Edges are offset by half this amount.",
     )
@@ -290,12 +300,25 @@ def parse_args():
     )
     ap.add_argument(
         "--chamfer-width-mm",
-        default=0.5,
+        default=1.0,
         type=float,
         help=(
             "How far the chamfer around the bottom edge of every tile reaches in from the wall (mm). "
             "It is cut slightly steeper than 45 degrees so it prints without support. "
             "Set to 0 to keep a square bottom edge."
+        ),
+    )
+    ap.add_argument(
+        "--asymmetric-clearance-file",
+        default="",
+        type=str,
+        metavar="PATH",
+        help=(
+            "CSV holding the fitting clearance of every tile edge separately, so tiles that are "
+            "already printed can keep the clearance they were printed with. If PATH does not exist "
+            f"(or names a directory) a stock file at the current clearance is written there "
+            f"(as {ASYMMETRIC_CLEARANCE_FILENAME} for a directory) and the run stops, so it can be "
+            "edited and passed back in."
         ),
     )
     ap.add_argument(
@@ -3030,6 +3053,195 @@ def _effective_chamfer_width_mm(args) -> float:
     return float(args.chamfer_width_mm) / _effective_print_scale(args)
 
 
+def effective_map_size_mm(args) -> tuple[float, float]:
+    """
+    Return the assembled map size in mm.
+
+    Only needs the bounding box, so the tile grid can be worked out without paying
+    for the DEM load.
+    """
+    local_crs = choose_local_crs(args.lat_min, args.lat_max, args.lon_min, args.lon_max)
+    _, _, _, _, bbox_w_m, bbox_h_m = project_bbox_to_local_m(
+        args.lat_min, args.lat_max, args.lon_min, args.lon_max, local_crs
+    )
+    aspect_m = bbox_w_m / float(bbox_h_m) if bbox_h_m else 1.0
+    return fit_mm_bbox_preserve_aspect_ratio(args.final_width_mm, args.final_height_mm, aspect_m)
+
+
+def tile_grid_shape(args) -> tuple[int, int]:
+    """Return `(nx, ny)`, the tile counts across and down the assembled map."""
+    eff_width_mm, eff_height_mm = effective_map_size_mm(args)
+    nx = len(plan_tile_starts_mm(eff_width_mm, args.bed_width_mm, args.overlap_width_mm))
+    ny = len(plan_tile_starts_mm(eff_height_mm, args.bed_height_mm, args.overlap_width_mm))
+    return nx, ny
+
+
+def format_asymmetric_clearance_csv(
+    nx: int,
+    ny: int,
+    side_clearance_mm: float,
+    border_clearance_mm: float = 0.0,
+) -> str:
+    """
+    Inputs:
+    - `nx`, `ny`: tile counts across and down the map.
+    - `side_clearance_mm`: per-side clearance to fill in on every shared edge.
+    - `border_clearance_mm`: per-side clearance on edges with no neighbour.
+
+    Outputs:
+    - Returns the table text: one 3x3 block per tile, the tile id in the middle and
+      its four edge clearances around it, padded so the blocks line up in a
+      monospace editor.
+    """
+    width = _CLEARANCE_FIELD_WIDTH
+
+    def cell(text: str) -> str:
+        return f"{text:>{width}}"
+
+    def number(value: float) -> str:
+        return cell(f"{float(value):.2f}")
+
+    blank = cell("")
+    lines = [
+        "# Fitting clearance of every tile edge, in mm, per side.",
+        "# Each tile is a 3x3 block: its id in the middle, and around it how far that",
+        "# tile's wall is pulled back from the cut line on each edge. The gap between",
+        "# two neighbours is the sum of the two values facing each other, so a tile that",
+        "# is already printed can keep its own value while its neighbour changes.",
+        "# Edges on the outside of the map are not mating surfaces and stay at 0.00.",
+        f"# Grid is {nx} tiles across by {ny} down; ids match the exported tile_TY_TX.stl names.",
+    ]
+    for ty in range(int(ny)):
+        top_row: list[str] = []
+        middle_row: list[str] = []
+        bottom_row: list[str] = []
+        for tx in range(int(nx)):
+            top = border_clearance_mm if ty == 0 else side_clearance_mm
+            bottom = border_clearance_mm if ty == int(ny) - 1 else side_clearance_mm
+            left = border_clearance_mm if tx == 0 else side_clearance_mm
+            right = border_clearance_mm if tx == int(nx) - 1 else side_clearance_mm
+            top_row += [blank, number(top), blank]
+            middle_row += [number(left), cell(f"{ty:02d}_{tx:02d}"), number(right)]
+            bottom_row += [blank, number(bottom), blank]
+        lines += [",".join(top_row), ",".join(middle_row), ",".join(bottom_row)]
+    return "\n".join(lines) + "\n"
+
+
+def parse_asymmetric_clearance_csv(text: str, nx: int, ny: int) -> dict[tuple[int, int], dict[str, float]]:
+    """
+    Inputs:
+    - `text`: contents of a table written by `format_asymmetric_clearance_csv`.
+    - `nx`, `ny`: tile counts the table has to match.
+
+    Outputs:
+    - Returns `{(tx, ty): {edge: clearance_mm}}` for every tile.
+
+    Blank lines and `#` comments are skipped, and the tile ids in the middle of each
+    block are checked, so a table that has drifted out of step with the tiling is
+    reported rather than silently applied to the wrong edges.
+    """
+    rows: list[list[str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        rows.append([field.strip() for field in raw.split(",")])
+
+    if len(rows) != 3 * int(ny):
+        raise ValueError(
+            f"Clearance table has {len(rows)} rows but a {nx}x{ny} tiling needs {3 * int(ny)}"
+        )
+    for index, row in enumerate(rows):
+        if len(row) != 3 * int(nx):
+            raise ValueError(
+                f"Clearance table row {index + 1} has {len(row)} fields but needs {3 * int(nx)}"
+            )
+
+    def value(field: str, tx: int, ty: int, edge: str) -> float:
+        if not field:
+            raise ValueError(f"Clearance table is missing the {edge} value of tile {ty:02d}_{tx:02d}")
+        try:
+            parsed = float(field)
+        except ValueError as exc:
+            raise ValueError(
+                f"Clearance table has {field!r} for the {edge} edge of tile {ty:02d}_{tx:02d}"
+            ) from exc
+        if parsed < 0.0:
+            raise ValueError(
+                f"Clearance table has a negative {edge} value for tile {ty:02d}_{tx:02d}"
+            )
+        return parsed
+
+    table: dict[tuple[int, int], dict[str, float]] = {}
+    for ty in range(int(ny)):
+        for tx in range(int(nx)):
+            label = rows[3 * ty + 1][3 * tx + 1]
+            expected = f"{ty:02d}_{tx:02d}"
+            if label and label != expected:
+                raise ValueError(
+                    f"Clearance table names tile {label!r} where {expected!r} was expected; "
+                    "the table does not line up with the tiling"
+                )
+            table[(tx, ty)] = {
+                "top": value(rows[3 * ty + 0][3 * tx + 1], tx, ty, "top"),
+                "left": value(rows[3 * ty + 1][3 * tx + 0], tx, ty, "left"),
+                "right": value(rows[3 * ty + 1][3 * tx + 2], tx, ty, "right"),
+                "bottom": value(rows[3 * ty + 2][3 * tx + 1], tx, ty, "bottom"),
+            }
+    return table
+
+
+def resolve_asymmetric_clearance_path(raw: str) -> Path:
+    """Turn the option's argument into the table's path, naming it for a directory."""
+    path = Path(raw).expanduser()
+    if path.is_dir() or (not path.exists() and path.suffix.lower() != ".csv"):
+        return path / ASYMMETRIC_CLEARANCE_FILENAME
+    return path
+
+
+def load_asymmetric_clearances(args, log: logging.Logger) -> Optional[dict[tuple[int, int], dict[str, float]]]:
+    """
+    Inputs:
+    - Parsed CLI arguments and a logger.
+
+    Outputs:
+    - Returns the per-edge clearance table, or `None` when the option is unused.
+    - Returns `None` after writing a stock table when the file does not exist yet,
+      having logged where it went; the caller stops there so it can be edited.
+
+    The caller tells the two apart with `asymmetric_clearance_pending`.
+    """
+    raw = str(args.asymmetric_clearance_file).strip()
+    if not raw:
+        return None
+
+    path = resolve_asymmetric_clearance_path(raw)
+    nx, ny = tile_grid_shape(args)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        side = _effective_fitting_clearance_mm(args) / 2.0
+        path.write_text(format_asymmetric_clearance_csv(nx, ny, side))
+        log.info(
+            "Wrote a stock clearance table for the %dx%d tiling at %.2fmm per side: %s",
+            nx,
+            ny,
+            side,
+            path,
+        )
+        log.info("Edit it and pass it back with --asymmetric-clearance-file to use it.")
+        return None
+
+    table = parse_asymmetric_clearance_csv(path.read_text(), nx, ny)
+    log.info("Per-edge clearances read from %s", path)
+    return table
+
+
+def asymmetric_clearance_pending(args) -> bool:
+    """True when the option was given but the table still has to be written."""
+    raw = str(args.asymmetric_clearance_file).strip()
+    return bool(raw) and not resolve_asymmetric_clearance_path(raw).exists()
+
+
 def load_raster_context(args, log: logging.Logger) -> RasterContext:
     """
     Inputs:
@@ -3043,10 +3255,7 @@ def load_raster_context(args, log: logging.Logger) -> RasterContext:
     _, _, _, _, bbox_w_m, bbox_h_m = project_bbox_to_local_m(
         args.lat_min, args.lat_max, args.lon_min, args.lon_max, local_crs
     )
-    aspect_m = bbox_w_m / float(bbox_h_m) if bbox_h_m else 1.0
-    eff_width_mm, eff_height_mm = fit_mm_bbox_preserve_aspect_ratio(
-        args.final_width_mm, args.final_height_mm, aspect_m
-    )
+    eff_width_mm, eff_height_mm = effective_map_size_mm(args)
     premerge_shape = _premerge_output_shape_for_nozzle(
         eff_width_mm=float(eff_width_mm),
         eff_height_mm=float(eff_height_mm),
@@ -3792,6 +4001,16 @@ def plot_corridor_lines(results: list[dict], ctx: RasterContext, args):
     plt.tight_layout()
 
 
+def _is_border_edge(tx: int, ty: int, edge: str, nx: int, ny: int) -> bool:
+    """True when a tile edge lies on the outside of the map and has no neighbour."""
+    return (
+        (edge == "top" and int(ty) == 0)
+        or (edge == "bottom" and int(ty) == int(ny) - 1)
+        or (edge == "left" and int(tx) == 0)
+        or (edge == "right" and int(tx) == int(nx) - 1)
+    )
+
+
 def _tile_bounds_mm(
     ctx: RasterContext,
     args,
@@ -4054,10 +4273,13 @@ def export_tile_meshes(
     plan: TilingPlan,
     args,
     log: logging.Logger,
+    edge_clearances: Optional[dict[tuple[int, int], dict[str, float]]] = None,
 ):
     """
     Inputs:
     - Solved corridor lines, raster context, tiling plan, parsed args, and logger.
+    - `edge_clearances`: optional per-tile per-edge clearances in mm, which replace
+      half of `--fitting-clearance` on the edges they cover.
 
     Outputs:
     - Writes the selected tile meshes to disk and logs progress.
@@ -4117,41 +4339,55 @@ def export_tile_meshes(
     border_y0 = -RELIEF_BORDER_PAD_MM
     border_x1 = float(ctx.eff_width_mm) + RELIEF_BORDER_PAD_MM
     border_y1 = float(ctx.eff_height_mm) + RELIEF_BORDER_PAD_MM
+    print_scale = _effective_print_scale(args)
+    map_w = float(ctx.eff_width_mm)
+    map_h = float(ctx.eff_height_mm)
+
+    def edge_offset(tx: int, ty: int, edge: str) -> float:
+        """Per-side pull-back of one tile edge, in pre-scale mm."""
+        if edge_clearances is None:
+            return half_clearance
+        return float(edge_clearances[(int(tx), int(ty))][edge]) / print_scale
 
     tasks: list[dict] = []
     for ty in range(ny):
-        top_line = (
-            np.array([[0.0, 0.0], [float(ctx.eff_width_mm), 0.0]], dtype=float)
-            if ty == 0
-            else offset_polyline(row_lines[ty], -half_clearance, constrain_axis=0)
-        )
-        bot_line = (
-            np.array([[0.0, float(ctx.eff_height_mm)], [float(ctx.eff_width_mm), float(ctx.eff_height_mm)]], dtype=float)
-            if ty == ny - 1
-            else offset_polyline(row_lines[ty + 1], half_clearance, constrain_axis=0)
-        )
-        relief_top_line = (
-            np.array([[border_x0, border_y0], [border_x1, border_y0]], dtype=float)
-            if ty == 0
-            else top_line
-        )
-        relief_bot_line = (
-            np.array([[border_x0, border_y1], [border_x1, border_y1]], dtype=float)
-            if ty == ny - 1
-            else bot_line
-        )
         for tx in range(nx):
             if selected_tiles is not None and (tx, ty) not in selected_tiles:
                 continue
+            top_off = edge_offset(tx, ty, "top")
+            bot_off = edge_offset(tx, ty, "bottom")
+            left_off = edge_offset(tx, ty, "left")
+            right_off = edge_offset(tx, ty, "right")
+
+            top_line = (
+                np.array([[0.0, top_off], [map_w, top_off]], dtype=float)
+                if ty == 0
+                else offset_polyline(row_lines[ty], -top_off, constrain_axis=0)
+            )
+            bot_line = (
+                np.array([[0.0, map_h - bot_off], [map_w, map_h - bot_off]], dtype=float)
+                if ty == ny - 1
+                else offset_polyline(row_lines[ty + 1], bot_off, constrain_axis=0)
+            )
             left_line = (
-                np.array([[0.0, 0.0], [0.0, float(ctx.eff_height_mm)]], dtype=float)
+                np.array([[left_off, 0.0], [left_off, map_h]], dtype=float)
                 if tx == 0
-                else offset_polyline(col_lines[tx], half_clearance, constrain_axis=1)
+                else offset_polyline(col_lines[tx], left_off, constrain_axis=1)
             )
             right_line = (
-                np.array([[float(ctx.eff_width_mm), 0.0], [float(ctx.eff_width_mm), float(ctx.eff_height_mm)]], dtype=float)
+                np.array([[map_w - right_off, 0.0], [map_w - right_off, map_h]], dtype=float)
                 if tx == nx - 1
-                else offset_polyline(col_lines[tx + 1], -half_clearance, constrain_axis=1)
+                else offset_polyline(col_lines[tx + 1], -right_off, constrain_axis=1)
+            )
+            relief_top_line = (
+                np.array([[border_x0, border_y0], [border_x1, border_y0]], dtype=float)
+                if ty == 0
+                else top_line
+            )
+            relief_bot_line = (
+                np.array([[border_x0, border_y1], [border_x1, border_y1]], dtype=float)
+                if ty == ny - 1
+                else bot_line
             )
             relief_left_line = (
                 np.array([[border_x0, border_y0], [border_x0, border_y1]], dtype=float)
@@ -4214,13 +4450,23 @@ def export_tile_meshes(
         chosen = ", ".join(f"{ty:02d}_{tx:02d}" for tx, ty in sorted(selected_tiles, key=lambda item: (item[1], item[0])))
         log.info("exporting selected tiles: %s", chosen)
     log.info("export tiles via local crops: %d tasks, workers=%d", len(tasks), export_workers)
+    if edge_clearances is None:
+        gap = "%.3fmm" % _effective_fitting_clearance_mm(args)
+    else:
+        shared = [
+            table[edge]
+            for (tx, ty), table in sorted(edge_clearances.items())
+            for edge in EDGE_NAMES
+            if not _is_border_edge(tx, ty, edge, nx, ny)
+        ]
+        gap = "%.3f..%.3fmm per side" % (min(shared), max(shared)) if shared else "n/a"
     log.info(
-        "wall fit: tight gap %.3fmm over %.2fmm at the bottom and below the low-passed top, "
-        "relieved gap %.3fmm in between via a pocket with 45deg ramps (smoothing sigma %.2fmm), "
-        "bottom chamfer %.2fmm",
-        _effective_fitting_clearance_mm(args),
+        "wall fit: tight gap %s over %.2fmm at the bottom and below the low-passed top, "
+        "plus a %.3fmm per side relief pocket with 45deg ramps in between "
+        "(smoothing sigma %.2fmm), bottom chamfer %.2fmm",
+        gap,
         tight_clearance_height_mm,
-        _effective_fitting_clearance_mm(args) + 2.0 * _effective_extra_clearance_mm(args),
+        _effective_extra_clearance_mm(args),
         float(args.relief_smoothing_mm),
         _effective_chamfer_width_mm(args),
     )
@@ -4307,11 +4553,15 @@ def main():
         raise ValueError("--relief-smoothing-mm must be >= 0")
     if float(args.chamfer_width_mm) < 0:
         raise ValueError("--chamfer-width-mm must be >= 0")
+    if asymmetric_clearance_pending(args):
+        load_asymmetric_clearances(args, log)
+        return
     if float(args.extra_clearance_mm) > 0 and float(args.tight_clearance_height_mm) > 0:
         if CHAMFER_SLOPE * float(args.chamfer_width_mm) >= float(args.tight_clearance_height_mm):
             raise ValueError("--chamfer-width-mm must stay below --tight-clearance-height-mm")
         if 2.0 * RELIEF_RAMP_FACTOR * float(args.extra_clearance_mm) >= float(args.tight_clearance_height_mm):
             raise ValueError("--extra-clearance-mm ramps do not fit in --tight-clearance-height-mm")
+    edge_clearances = load_asymmetric_clearances(args, log)
     ctx = load_raster_context(args, log)
     plan = plan_tiling(ctx, args)
     workers = resolve_worker_count(args.workers)
@@ -4320,7 +4570,7 @@ def main():
     plot_corridor_lines(results, ctx, args)
 
     if args.export_meshes is not None:
-        export_tile_meshes(results, ctx, plan, args, log)
+        export_tile_meshes(results, ctx, plan, args, log, edge_clearances=edge_clearances)
         plt.close("all")
         return
 

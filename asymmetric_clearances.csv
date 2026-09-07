@@ -1,0 +1,19 @@
+# Fitting clearance of every tile edge, in mm, per side.
+# Each tile is a 3x3 block: its id in the middle, and around it how far that
+# tile's wall is pulled back from the cut line on each edge. The gap between
+# two neighbours is the sum of the two values facing each other, so a tile that
+# is already printed can keep its own value while its neighbour changes.
+# Edges on the outside of the map are not mating surfaces and stay at 0.00.
+# Grid is 6 tiles across by 4 down; ids match the exported tile_TY_TX.stl names.
+      ,  0.00,      ,      ,  0.00,      ,      ,  0.00,      ,      ,  0.00,      ,      ,  0.00,      ,      ,  0.00,      
+  0.00, 00_00,  0.10,  0.10, 00_01,  0.10,  0.10, 00_02,  0.10,  0.10, 00_03,  0.10,  0.05, 00_04,  0.05,  0.05, 00_05,  0.00
+      ,  0.10,      ,      ,  0.10,      ,      ,  0.10,      ,      ,  0.10,      ,      ,  0.05,      ,      ,  0.05,      
+      ,  0.10,      ,      ,  0.05,      ,      ,  0.10,      ,      ,  0.05,      ,      ,  0.05,      ,      ,  0.05,      
+  0.00, 01_00,  0.10,  0.05, 01_01,  0.30,  0.10, 01_02,  0.10,  0.30, 01_03,  0.30,  0.30, 01_04,  0.05,  0.05, 01_05,  0.00
+      ,  0.10,      ,      ,  0.30,      ,      ,  0.10,      ,      ,  0.05,      ,      ,  0.05,      ,      ,  0.05,      
+      ,  0.10,      ,      ,  0.10,      ,      ,  0.30,      ,      ,  0.05,      ,      ,  0.05,      ,      ,  0.05,      
+  0.00, 02_00,  0.10,  0.10, 02_01,  0.10,  0.05, 02_02,  0.05,  0.05, 02_03,  0.05,  0.05, 02_04,  0.05,  0.05, 02_05,  0.00
+      ,  0.10,      ,      ,  0.10,      ,      ,  0.05,      ,      ,  0.05,      ,      ,  0.05,      ,      ,  0.05,      
+      ,  0.05,      ,      ,  0.05,      ,      ,  0.05,      ,      ,  0.05,      ,      ,  0.05,      ,      ,  0.05,      
+  0.00, 03_00,  0.30,  0.30, 03_01,  0.05,  0.05, 03_02,  0.05,  0.05, 03_03,  0.10,  0.10, 03_04,  0.05,  0.05, 03_05,  0.00
+      ,  0.00,      ,      ,  0.00,      ,      ,  0.00,      ,      ,  0.00,      ,      ,  0.00,      ,      ,  0.00,      
