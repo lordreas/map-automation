@@ -10,7 +10,9 @@ from collections import deque
 from pathlib import Path
 from dataclasses import dataclass
 from multiprocessing import get_context
+import json
 import logging
+import subprocess
 import time
 import struct
 from typing import Callable, Optional
@@ -84,6 +86,10 @@ _PINCH_NUDGE_MM = 1e-3
 # even a piece one raster cell wide holds far more than this, while the flattened
 # shells a boolean leaves behind hold none at all.
 SCRAP_VOLUME_MM3 = 0.2
+
+# A component with at least this many faces is real geometry whatever its volume
+# measures, which keeps the cheap tests below off the multi-million face body.
+SOLID_FACE_COUNT = 1000
 
 # Stock name for the per-edge clearance table when a directory is given.
 ASYMMETRIC_CLEARANCE_FILENAME = "asymmetric_clearances.csv"
@@ -2819,6 +2825,27 @@ def _flip_mesh_across_x_axis(mesh: trimesh.Trimesh, total_height_mm: float) -> t
     return mesh
 
 
+def _holds_material(part: trimesh.Trimesh) -> bool:
+    """
+    Decide whether one connected component could be printed material.
+
+    Volume alone cannot answer this. Trimesh sums it about the origin, so for a
+    shell that is not closed the figure is meaningless *and* grows with distance
+    from the origin - and tiles sit at absolute map coordinates, up to 1500mm out.
+    A single stray triangle there reported almost half a cubic millimetre. So ask
+    first whether the shell is closed at all, since an open one holds nothing however
+    the sum comes out, and only then compare its volume.
+    """
+    if len(part.faces) >= SOLID_FACE_COUNT:
+        return True
+    if len(part.faces) < 4:
+        return False        # fewer faces than a tetrahedron cannot enclose anything
+    if not part.is_watertight:
+        return False
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return abs(float(part.volume)) >= SCRAP_VOLUME_MM3
+
+
 def quantize_to_stl_precision(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     """
     Round a mesh to the precision an STL can carry, then weld what collapses.
@@ -2854,14 +2881,12 @@ def drop_boolean_scraps(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, int, fl
     parts = mesh.split(only_watertight=False)
     if len(parts) <= 1:
         return mesh, 0, 0.0
-    with np.errstate(invalid="ignore", divide="ignore"):
-        volumes = [abs(float(part.volume)) for part in parts]
-    keep = [part for part, volume in zip(parts, volumes) if volume >= SCRAP_VOLUME_MM3]
-    dropped = [(part, volume) for part, volume in zip(parts, volumes) if volume < SCRAP_VOLUME_MM3]
+    keep = [part for part in parts if _holds_material(part)]
+    dropped = [part for part in parts if not _holds_material(part)]
     if not keep or not dropped:
         return mesh, 0, 0.0
     cleaned = keep[0] if len(keep) == 1 else trimesh.util.concatenate(keep)
-    return cleaned, len(dropped), float(sum(part.area for part, _volume in dropped))
+    return cleaned, len(dropped), float(sum(part.area for part in dropped))
 
 
 def _empty_mesh_for_tile(tx: int, ty: int) -> trimesh.Trimesh:
@@ -3213,6 +3238,87 @@ def parse_asymmetric_clearance_csv(text: str, nx: int, ny: int) -> dict[tuple[in
                 "bottom": value(rows[3 * ty + 2][3 * tx + 1], tx, ty, "bottom"),
             }
     return table
+
+
+def format_tile_clearance_csv(tx: int, ty: int, edges: dict[str, float]) -> str:
+    """
+    Render one tile's block of the clearance table, for shipping beside its mesh.
+
+    Same layout as the full table, so it reads the same way and parses the same
+    way: the tile id in the middle with its four edge clearances around it.
+    """
+    width = _CLEARANCE_FIELD_WIDTH
+    cell = lambda text: f"{text:>{width}}"
+    number = lambda value: cell(f"{float(value):.3f}")
+    blank = cell("")
+    return "\n".join([
+        f"# Fitting clearance per side, in mm, used for tile {ty:02d}_{tx:02d}.",
+        "# The tile id sits in the middle with its four edge clearances around it.",
+        "# 0.000 marks an edge on the outside of the map, which has no neighbour.",
+        ",".join([blank, number(edges["top"]), blank]),
+        ",".join([number(edges["left"]), cell(f"{ty:02d}_{tx:02d}"), number(edges["right"])]),
+        ",".join([blank, number(edges["bottom"]), blank]),
+    ]) + "\n"
+
+
+def _yaml_scalar(value) -> str:
+    """Render one value as a YAML scalar, quoting anything that is not a number."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return repr(value)
+    return json.dumps(str(value))
+
+
+def _yaml_block(mapping: dict, indent: int = 2) -> list[str]:
+    pad = " " * indent
+    lines: list[str] = []
+    for key, value in mapping.items():
+        if isinstance(value, dict):
+            lines.append(f"{pad}{key}:")
+            lines.extend(_yaml_block(value, indent + 2))
+        elif isinstance(value, (list, tuple)):
+            if not value:
+                lines.append(f"{pad}{key}: []")
+            else:
+                lines.append(f"{pad}{key}: [" + ", ".join(_yaml_scalar(v) for v in value) + "]")
+        else:
+            lines.append(f"{pad}{key}: {_yaml_scalar(value)}")
+    return lines
+
+
+def format_tile_params_yaml(
+    args,
+    tx: int,
+    ty: int,
+    edges: dict[str, float],
+    derived: dict,
+) -> str:
+    """
+    Inputs:
+    - Parsed CLI arguments, the tile coordinate, the per-side edge clearances used
+      for it, and the derived values that went into its geometry.
+
+    Outputs:
+    - Returns a YAML record of everything that shaped one tile, so a mesh on disk
+      can be traced back to its settings now that they differ from tile to tile.
+    """
+    lines = [
+        f"# Settings used to generate tile_{ty:02d}_{tx:02d}.stl.",
+        "# Written next to the mesh because clearances now differ per tile.",
+        f"tile: {_yaml_scalar(f'{ty:02d}_{tx:02d}')}",
+        f"mesh: {_yaml_scalar(f'tile_{ty:02d}_{tx:02d}.stl')}",
+        f"generated_utc: {_yaml_scalar(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))}",
+        "edge_clearance_mm_per_side:",
+    ]
+    lines.extend(_yaml_block({name: round(float(edges[name]), 6) for name in EDGE_NAMES}))
+    lines.append("derived:")
+    lines.extend(_yaml_block(derived))
+    lines.append("argparse:")
+    lines.extend(_yaml_block({key: value for key, value in sorted(vars(args).items())}))
+    return "\n".join(lines) + "\n"
 
 
 def resolve_asymmetric_clearance_path(raw: str) -> Path:
@@ -4025,6 +4131,22 @@ def plot_corridor_lines(results: list[dict], ctx: RasterContext, args):
     plt.tight_layout()
 
 
+def _current_git_commit() -> Optional[str]:
+    """Return the checked-out commit, so a mesh can be traced back to the code."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    commit = result.stdout.strip()
+    return commit if result.returncode == 0 and commit else None
+
+
 def _is_border_edge(tx: int, ty: int, edge: str, nx: int, ny: int) -> bool:
     """True when a tile edge lies on the outside of the map and has no neighbour."""
     return (
@@ -4347,7 +4469,6 @@ def export_tile_meshes(
         raise RuntimeError("Cannot export meshes because the global elevation range is invalid")
     col_starts_mm = plan.col_starts_mm
     row_starts_mm = plan.row_starts_mm
-    half_clearance = _effective_fitting_clearance_mm(args) / 2.0
     selected_tiles = _parse_export_tile_selection(args.export_meshes, nx, ny)
 
     missing_cols = [idx for idx in range(1, nx) if idx not in col_lines]
@@ -4368,21 +4489,28 @@ def export_tile_meshes(
     map_w = float(ctx.eff_width_mm)
     map_h = float(ctx.eff_height_mm)
 
-    def edge_offset(tx: int, ty: int, edge: str) -> float:
-        """Per-side pull-back of one tile edge, in pre-scale mm."""
-        if edge_clearances is None:
-            return half_clearance
-        return float(edge_clearances[(int(tx), int(ty))][edge]) / print_scale
+    def edge_clearance_mm(tx: int, ty: int, edge: str) -> float:
+        """Per-side clearance of one tile edge in mm, as the printed part will have it."""
+        if edge_clearances is not None:
+            return float(edge_clearances[(int(tx), int(ty))][edge])
+        if _is_border_edge(tx, ty, edge, nx, ny):
+            return 0.0
+        return float(args.fitting_clearance) / 2.0
 
+    git_commit = _current_git_commit()
+    metadata: dict[tuple[int, int], tuple[str, str]] = {}
     tasks: list[dict] = []
     for ty in range(ny):
         for tx in range(nx):
             if selected_tiles is not None and (tx, ty) not in selected_tiles:
                 continue
-            top_off = edge_offset(tx, ty, "top")
-            bot_off = edge_offset(tx, ty, "bottom")
-            left_off = edge_offset(tx, ty, "left")
-            right_off = edge_offset(tx, ty, "right")
+            edges = {name: edge_clearance_mm(tx, ty, name) for name in EDGE_NAMES}
+            # The mesh is built before the print scale is applied, so pull the walls
+            # back by the pre-scale amount that lands on the asked-for clearance.
+            top_off = edges["top"] / print_scale
+            bot_off = edges["bottom"] / print_scale
+            left_off = edges["left"] / print_scale
+            right_off = edges["right"] / print_scale
 
             top_line = (
                 np.array([[0.0, top_off], [map_w, top_off]], dtype=float)
@@ -4428,6 +4556,50 @@ def export_tile_meshes(
             crop_x0_px, crop_x1_px, crop_y0_px, crop_y1_px = _tile_crop_bounds_px(ctx, args, tile_bounds_mm)
             bottom_core_rect = _tile_bottom_core_rect_mm(args, tile_bounds_mm, tx, ty, nx, ny)
             out_path = out_dir / f"tile_{ty:02d}_{tx:02d}.stl"
+            metadata[(tx, ty)] = (
+                format_tile_clearance_csv(tx, ty, edges),
+                format_tile_params_yaml(
+                    args,
+                    tx,
+                    ty,
+                    edges,
+                    {
+                        "git_commit": git_commit,
+                        "tile_grid": {"nx": int(nx), "ny": int(ny)},
+                        "clearance_table": str(args.asymmetric_clearance_file).strip() or None,
+                        "map_size_mm": {"width": float(ctx.eff_width_mm), "height": float(ctx.eff_height_mm)},
+                        "tile_bounds_mm": {
+                            "x0": float(tile_bounds_mm[0]), "x1": float(tile_bounds_mm[1]),
+                            "y0": float(tile_bounds_mm[2]), "y1": float(tile_bounds_mm[3]),
+                        },
+                        "crop_px": {
+                            "x0": int(crop_x0_px), "x1": int(crop_x1_px),
+                            "y0": int(crop_y0_px), "y1": int(crop_y1_px),
+                        },
+                        "mm_per_px": {"x": float(ctx.mm_per_px_x), "y": float(ctx.mm_per_px_y)},
+                        "elevation_range_m": {"min": float(global_h_min), "max": float(global_h_max)},
+                        "z_range_mm": {"min": float(z_min), "max": float(z_max)},
+                        "print_scale": float(print_scale),
+                        "effective_mm": {
+                            "fitting_clearance": _effective_fitting_clearance_mm(args),
+                            "extra_clearance": _effective_extra_clearance_mm(args),
+                            "chamfer_width": _effective_chamfer_width_mm(args),
+                            "tight_clearance_height": tight_clearance_height_mm,
+                            "nozzle_diameter": _effective_nozzle_diameter_mm(args),
+                        },
+                        "relief_shape": {
+                            "ramp_factor": RELIEF_RAMP_FACTOR,
+                            "erosion_factor": RELIEF_EROSION_FACTOR,
+                            "taper_ring_count": TAPER_RING_COUNT,
+                            "taper_subdivisions": TAPER_SUBDIVISIONS,
+                            "min_pocket_height_mm": MIN_POCKET_HEIGHT_MM,
+                            "chamfer_slope": CHAMFER_SLOPE,
+                        },
+                        "scrap_volume_threshold_mm3": SCRAP_VOLUME_MM3,
+                        "stencil": stencil_stl_path or None,
+                    },
+                ),
+            )
             tasks.append(
                 {
                     "tx": int(tx),
@@ -4519,6 +4691,12 @@ def export_tile_meshes(
                 for result in tqdm(it, total=len(tasks), desc="Export tiles", unit="tile"):
                     status = str(result.get("status", "error"))
                     if status == "ok":
+                        key = (int(result["tx"]), int(result["ty"]))
+                        if key in metadata:
+                            clearance_text, params_text = metadata[key]
+                            stem = f"{int(result['ty']):02d}_{int(result['tx']):02d}"
+                            (out_dir / f"clearances_{stem}.csv").write_text(clearance_text)
+                            (out_dir / f"params_{stem}.yaml").write_text(params_text)
                         log.info(
                             "Exported %s (tile %02d_%02d, %.2fs, relief %.3fmm/side, chamfer %.2fmm, "
                             "%d bodies, dropped %d scraps totalling %.4f mm^2)",
