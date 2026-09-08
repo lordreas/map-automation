@@ -79,14 +79,16 @@ TAPER_SUBDIVISIONS = 2
 # boolean engine merges them again, small enough to be meaningless in a print.
 _PINCH_NUDGE_MM = 1e-3
 
-# Surface area below which a disconnected shell left behind by a boolean is debris
-# rather than material. A closed shell this small cannot hold a printable volume.
-SCRAP_AREA_MM2 = 1.0
+# Volume below which a disconnected shell left behind by a boolean is debris rather
+# than material. Every real piece of a tile spans the full bottom thickness, so
+# even a piece one raster cell wide holds far more than this, while the flattened
+# shells a boolean leaves behind hold none at all.
+SCRAP_VOLUME_MM3 = 0.2
 
 # Stock name for the per-edge clearance table when a directory is given.
 ASYMMETRIC_CLEARANCE_FILENAME = "asymmetric_clearances.csv"
 
-# Field width of that table, chosen so "00_00" and " 0.10" line up in a monospace
+# Field width of that table, chosen so "00_00" and "0.075" line up in a monospace
 # editor and the tile blocks read as a grid.
 _CLEARANCE_FIELD_WIDTH = 6
 
@@ -2817,6 +2819,22 @@ def _flip_mesh_across_x_axis(mesh: trimesh.Trimesh, total_height_mm: float) -> t
     return mesh
 
 
+def quantize_to_stl_precision(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """
+    Round a mesh to the precision an STL can carry, then weld what collapses.
+
+    STL stores single precision floats. Tile coordinates run to about 1500mm,
+    where single precision resolves only ~0.1 micron, so writing the file merges
+    vertices that were distinct and chips tiny shells off the solid. Doing the
+    rounding here means `drop_boolean_scraps` sees those shells and removes them,
+    and what is written then reads back exactly as it was checked: one solid.
+    """
+    mesh = mesh.copy()
+    mesh.vertices = np.asarray(mesh.vertices, dtype=np.float32).astype(np.float64)
+    mesh.merge_vertices()
+    return mesh
+
+
 def drop_boolean_scraps(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, int, float]:
     """
     Inputs:
@@ -2826,20 +2844,24 @@ def drop_boolean_scraps(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, int, fl
     - Returns `(cleaned, dropped_count, dropped_area_mm2)`.
 
     Cutting a fine tool out of a much coarser terrain mesh leaves behind sub-
-    millimetre shells along the cut. They hold no volume and no slicer can print
-    them, but they make the result read as many bodies, so drop them. Anything
-    larger than `SCRAP_AREA_MM2` is kept, so a tile that genuinely falls into
-    several pieces survives and stays visible to the caller.
+    millimetre shells along the cut. They are flattened, so they hold no volume and
+    no slicer can print them, but they make the result read as many bodies. Drop
+    them by volume rather than by area: a shell can have a surface area of a couple
+    of square millimetres while enclosing nothing, whereas any real piece of a tile
+    spans the full bottom thickness and so is larger by orders of magnitude. A tile
+    that genuinely falls into several pieces therefore survives and stays visible.
     """
     parts = mesh.split(only_watertight=False)
     if len(parts) <= 1:
         return mesh, 0, 0.0
-    keep = [part for part in parts if part.area >= SCRAP_AREA_MM2]
-    dropped = [part for part in parts if part.area < SCRAP_AREA_MM2]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        volumes = [abs(float(part.volume)) for part in parts]
+    keep = [part for part, volume in zip(parts, volumes) if volume >= SCRAP_VOLUME_MM3]
+    dropped = [(part, volume) for part, volume in zip(parts, volumes) if volume < SCRAP_VOLUME_MM3]
     if not keep or not dropped:
         return mesh, 0, 0.0
     cleaned = keep[0] if len(keep) == 1 else trimesh.util.concatenate(keep)
-    return cleaned, len(dropped), float(sum(part.area for part in dropped))
+    return cleaned, len(dropped), float(sum(part.area for part, _volume in dropped))
 
 
 def _empty_mesh_for_tile(tx: int, ty: int) -> trimesh.Trimesh:
@@ -3099,7 +3121,9 @@ def format_asymmetric_clearance_csv(
         return f"{text:>{width}}"
 
     def number(value: float) -> str:
-        return cell(f"{float(value):.2f}")
+        # Three decimals so halving an odd hundredth stays exact: a 0.15mm seam
+        # splits into 0.075 per side, which two decimals cannot hold.
+        return cell(f"{float(value):.3f}")
 
     blank = cell("")
     lines = [
@@ -4245,6 +4269,7 @@ def _worker_export_tile_mesh(task: dict):
             tile_mesh = _mesh_difference(tile_mesh, stencil_mesh, preferred_engine="manifold")
             if tile_mesh.is_empty:
                 return {"status": "empty", "tx": tx, "ty": ty}
+        tile_mesh = quantize_to_stl_precision(tile_mesh)
         tile_mesh, scrap_count, scrap_area = drop_boolean_scraps(tile_mesh)
         out_path = str(task["out_path"])
         tile_mesh.export(out_path)
