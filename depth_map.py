@@ -3176,6 +3176,18 @@ def format_asymmetric_clearance_csv(
     return "\n".join(lines) + "\n"
 
 
+def _split_clearance_row(line: str) -> list[str]:
+    """
+    Split one row of the clearance table into fields.
+
+    A spreadsheet saved in a comma-decimal locale writes 0,075 and separates
+    fields with semicolons, so prefer the semicolon wherever a row has one and
+    those decimals survive intact.
+    """
+    delimiter = ";" if ";" in line else ","
+    return [field.strip() for field in line.split(delimiter)]
+
+
 def parse_asymmetric_clearance_csv(text: str, nx: int, ny: int) -> dict[tuple[int, int], dict[str, float]]:
     """
     Inputs:
@@ -3188,13 +3200,19 @@ def parse_asymmetric_clearance_csv(text: str, nx: int, ny: int) -> dict[tuple[in
     Blank lines and `#` comments are skipped, and the tile ids in the middle of each
     block are checked, so a table that has drifted out of step with the tiling is
     reported rather than silently applied to the wrong edges.
+
+    Rows separated by semicolons and values written with a comma as the decimal
+    mark are both accepted, so a table that has been through a spreadsheet in a
+    European locale still reads correctly.
     """
     rows: list[list[str]] = []
+    raw_rows: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        rows.append([field.strip() for field in raw.split(",")])
+        rows.append(_split_clearance_row(raw))
+        raw_rows.append(raw)
 
     if len(rows) != 3 * int(ny):
         raise ValueError(
@@ -3202,15 +3220,25 @@ def parse_asymmetric_clearance_csv(text: str, nx: int, ny: int) -> dict[tuple[in
         )
     for index, row in enumerate(rows):
         if len(row) != 3 * int(nx):
+            hint = ""
+            if len(row) > 3 * int(nx) and ";" not in raw_rows[index]:
+                # Excel in a comma-decimal locale writes 0,075 and still separates
+                # fields with commas, which splits every value into two fields.
+                hint = (
+                    ". This looks like a spreadsheet export that used a comma as the "
+                    "decimal mark and as the field separator; save it with semicolons "
+                    "between fields, or with dots as the decimal mark"
+                )
             raise ValueError(
-                f"Clearance table row {index + 1} has {len(row)} fields but needs {3 * int(nx)}"
+                f"Clearance table row {index + 1} has {len(row)} fields but needs {3 * int(nx)}{hint}"
             )
 
     def value(field: str, tx: int, ty: int, edge: str) -> float:
         if not field:
             raise ValueError(f"Clearance table is missing the {edge} value of tile {ty:02d}_{tx:02d}")
         try:
-            parsed = float(field)
+            # a comma here is a decimal mark: the field separator is already gone
+            parsed = float(field.replace(",", "."))
         except ValueError as exc:
             raise ValueError(
                 f"Clearance table has {field!r} for the {edge} edge of tile {ty:02d}_{tx:02d}"
