@@ -333,6 +333,17 @@ def parse_args():
         ),
     )
     ap.add_argument(
+        "--min-below-sea-patch-px",
+        default=10,
+        type=int,
+        help=(
+            "Ground below sea level is only cut in where it forms a connected patch of at "
+            "least this many raster samples. Along a steep coast the DEM and the coastline "
+            "disagree by a pixel or two, which speckles the shoreline with stray dips; real "
+            "ground below sea level comes in patches orders of magnitude larger."
+        ),
+    )
+    ap.add_argument(
         "--chamfer-width-mm",
         default=1.0,
         type=float,
@@ -3215,6 +3226,7 @@ def apply_sea_level_model(
     elev_map: np.ndarray,
     land_mask: Optional[np.ndarray],
     min_land_elevation_m: float,
+    min_patch_px: int = 1,
 ) -> np.ndarray:
     """
     Inputs:
@@ -3222,6 +3234,7 @@ def apply_sea_level_model(
     - `land_mask`: True where the coastline says land, or `None` to flatten
       everything below sea level as before.
     - `min_land_elevation_m`: floor applied to land that lies below sea level.
+    - `min_patch_px`: smallest connected run of below-sea-level land that is kept.
 
     Outputs:
     - Returns the raster the printed surface is built from: sea flat at zero,
@@ -3230,15 +3243,30 @@ def apply_sea_level_model(
     Only samples the DEM already reads as negative are touched. Positive ground is
     left exactly as it is, so a coastline that disagrees with the DEM by a few
     pixels - which happens along every steep coast - can never flatten real relief.
+
+    That same disagreement speckles steep shorelines with isolated samples that dip
+    just below zero, so patches smaller than `min_patch_px` are put back at sea
+    level. Neighbours are counted edgewise, which treats a diagonal string of single
+    pixels - the shape a misplaced coastline actually makes - as the separate specks
+    it is rather than as one patch.
     """
     out = np.array(elev_map, dtype=np.float32, copy=True)
     below = np.isfinite(out) & (out < 0.0)
     if land_mask is None:
         out[below] = 0.0
         return out
-    sea = below & ~land_mask
     land_below = below & land_mask
-    out[sea] = 0.0
+    if int(min_patch_px) > 1 and land_below.any():
+        from scipy import ndimage
+
+        labels, count = ndimage.label(land_below)
+        if count:
+            sizes = np.bincount(labels.ravel())
+            big_enough = sizes >= int(min_patch_px)
+            big_enough[0] = False
+            land_below = big_enough[labels]
+    # sea, plus any speck of land below sea level too small to be real
+    out[below & ~land_below] = 0.0
     np.maximum(out, np.float32(min_land_elevation_m), out=out, where=land_below)
     return out
 
@@ -3602,14 +3630,19 @@ def load_raster_context(args, log: logging.Logger) -> RasterContext:
         )
     land_mask = build_land_mask(args, elev_map.shape, log)
     terrain_elev_map = apply_sea_level_model(
-        elev_map, land_mask, float(args.min_land_elevation_m)
+        elev_map,
+        land_mask,
+        float(args.min_land_elevation_m),
+        min_patch_px=int(args.min_below_sea_patch_px),
     )
     if land_mask is not None:
         below = np.isfinite(terrain_elev_map) & (terrain_elev_map < 0.0)
         log.info(
-            "sea flattened to zero; %d samples of land below sea level kept (down to %.1f m)",
+            "sea flattened to zero; %d samples of land below sea level kept "
+            "(down to %.1f m, patches of %d samples or more)",
             int(below.sum()),
             float(terrain_elev_map[below].min()) if below.any() else 0.0,
+            int(args.min_below_sea_patch_px),
         )
     # The corridor solver keeps the old fully clamped view so the cut lines, and
     # therefore every seam on the already printed tiles, stay exactly as they were.
@@ -4330,7 +4363,15 @@ def _current_git_commit() -> Optional[str]:
     except (OSError, subprocess.SubprocessError):
         return None
     commit = result.stdout.strip()
-    return commit if result.returncode == 0 and commit else None
+    if result.returncode != 0 or not commit:
+        return None
+    # Flag uncommitted edits, so a recorded commit cannot imply code that was not
+    # actually the code that ran.
+    dirty = subprocess.run(
+        ["git", "-C", str(Path(__file__).resolve().parent), "status", "--porcelain", "--", "depth_map.py"],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    return commit + ("-dirty" if dirty.returncode == 0 and dirty.stdout.strip() else "")
 
 
 def _is_border_edge(tx: int, ty: int, edge: str, nx: int, ny: int) -> bool:
@@ -4780,6 +4821,7 @@ def export_tile_meshes(
                         "sea_level_model": {
                             "coastline": coastline_note,
                             "min_land_elevation_m": float(args.min_land_elevation_m),
+                            "min_below_sea_patch_px": int(args.min_below_sea_patch_px),
                             "note": "sea flat at zero; land below sea level mirrors the height curve",
                         },
                         "z_range_mm": {"min": float(z_min), "max": float(z_max)},
