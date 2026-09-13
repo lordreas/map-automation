@@ -12,3 +12,4 @@ depth_map_elev_*.mmap
 *.mmap
 *.stl
 *.obj
+coastline/

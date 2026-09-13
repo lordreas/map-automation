@@ -91,6 +91,12 @@ SCRAP_VOLUME_MM3 = 0.2
 # measures, which keeps the cheap tests below off the multi-million face body.
 SOLID_FACE_COUNT = 1000
 
+# Land polygons derived from the OpenStreetMap coastline, rebuilt daily. Used only
+# to tell sea apart from ground that lies below sea level, which no DEM can express.
+COASTLINE_URL = "https://osmdata.openstreetmap.de/download/land-polygons-complete-4326.zip"
+COASTLINE_ARCHIVE_NAME = "land-polygons-complete-4326.zip"
+COASTLINE_SHAPEFILE = "land-polygons-complete-4326/land_polygons.shp"
+
 # Stock name for the per-edge clearance table when a directory is given.
 ASYMMETRIC_CLEARANCE_FILENAME = "asymmetric_clearances.csv"
 
@@ -304,6 +310,26 @@ def parse_args():
         help=(
             "Extra per-side inset (mm) applied to mating walls between the tight bands, as a friction relief. "
             "The relieved gap becomes fitting_clearance + 2 * this value. Set to 0 to disable the relief."
+        ),
+    )
+    ap.add_argument(
+        "--coastline-dir",
+        default="coastline",
+        type=str,
+        help=(
+            "Directory holding the OSM land polygons and the land mask derived from them. "
+            "The archive is downloaded on first use. Set to an empty string to skip the "
+            "coastline entirely, which flattens everything below sea level as before."
+        ),
+    )
+    ap.add_argument(
+        "--min-land-elevation-m",
+        default=-20.0,
+        type=float,
+        help=(
+            "Land below sea level is clipped to this elevation (m). The DEM disagrees with the "
+            "coastline by a few pixels along steep coasts, which would otherwise pull a shoreline "
+            "pixel down to the sea floor; real ground in this map only reaches about -7 m."
         ),
     )
     ap.add_argument(
@@ -622,6 +648,12 @@ def downsample_elevation_map_for_nozzle(
 @dataclass
 class RasterContext:
     elev_map: np.ndarray
+    # The surface the mesh is built from. Differs from `elev_map` only below sea
+    # level: `elev_map` stays flattened at zero so the corridor solver keeps
+    # producing the cut lines it always has, while this one keeps ground that lies
+    # below sea level so it still shows relief.
+    terrain_elev_map: np.ndarray
+    land_mask: Optional[np.ndarray]
     img_h: int
     img_w: int
     bbox_w_m: float
@@ -1901,12 +1933,18 @@ def _top_z_grid_from_elevation(
         h_max = float(norm_h_max)
     denom = max(1e-12, h_max - h_min)
 
-    # Normalize to [0, 1]
+    # Normalize to [0, 1]. Ground below sea level gives a negative t, which the
+    # exponent cannot take, so carry the sign separately and put it back after:
+    # the curve is mirrored about sea level rather than cut off there. Its slope at
+    # zero is vertical, so mirroring is what continues it - a tangent does not exist.
     t = (elev_map - h_min) / denom
     t[~valid_mask] = 0.0 # Handle NaNs by setting to min height
-    np.clip(t, 0.0, 1.0, out=t)
+    np.clip(t, -1.0, 1.0, out=t)
+    sign = np.sign(t)
+    np.abs(t, out=t)
     if abs(float(height_exponent) - 1.0) > 1e-9:
         np.power(t, float(height_exponent), out=t)
+    t *= sign
 
     # Map to mm Z
     return bottom_thickness_mm + t * desired_height_mm
@@ -3100,6 +3138,111 @@ def _effective_chamfer_width_mm(args) -> float:
     return float(args.chamfer_width_mm) / _effective_print_scale(args)
 
 
+def land_mask_cache_path(coastline_dir: Path, args, shape: tuple[int, int]) -> Path:
+    """Name the cached mask after the bbox and grid it was rasterised for."""
+    return Path(coastline_dir) / (
+        f"land_mask_{args.lat_min}_{args.lat_max}_{args.lon_min}_{args.lon_max}"
+        f"_{int(shape[0])}x{int(shape[1])}.npy"
+    )
+
+
+def ensure_coastline_archive(coastline_dir: Path, log: logging.Logger) -> Path:
+    """Fetch the land polygon archive unless it is already on disk."""
+    archive = Path(coastline_dir) / COASTLINE_ARCHIVE_NAME
+    if archive.exists() and archive.stat().st_size > 0:
+        return archive
+    import urllib.request
+
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    log.info("downloading land polygons (about 900 MB, once): %s", COASTLINE_URL)
+    partial = archive.with_suffix(".part")
+    with Timer("download land polygons", log):
+        urllib.request.urlretrieve(COASTLINE_URL, partial)
+    partial.replace(archive)
+    return archive
+
+
+def build_land_mask(args, shape: tuple[int, int], log: logging.Logger) -> Optional[np.ndarray]:
+    """
+    Inputs:
+    - Parsed CLI arguments, the raster grid shape, and a logger.
+
+    Outputs:
+    - Returns a boolean grid, True where the OSM coastline says land, or `None`
+      when the coastline was switched off.
+
+    The result is cached per bounding box and grid, since rasterising the polygons
+    takes far longer than reading them back.
+    """
+    if not str(args.coastline_dir).strip():
+        return None
+    coastline_dir = Path(str(args.coastline_dir)).expanduser()
+    cache = land_mask_cache_path(coastline_dir, args, shape)
+    if cache.exists():
+        log.info("land mask read from cache: %s", cache)
+        return np.load(cache)
+
+    import geopandas as gpd
+    from rasterio.features import rasterize
+    from rasterio.transform import from_bounds
+
+    archive = ensure_coastline_archive(coastline_dir, log)
+    with Timer("read land polygons for the bbox", log):
+        land = gpd.read_file(
+            f"zip://{archive}!{COASTLINE_SHAPEFILE}",
+            bbox=(args.lon_min, args.lat_min, args.lon_max, args.lat_max),
+        )
+    log.info("land polygons covering the bbox: %d", len(land))
+    transform = from_bounds(args.lon_min, args.lat_min, args.lon_max, args.lat_max, shape[1], shape[0])
+    with Timer("rasterise land mask", log):
+        # all_touched keeps rocks and islets smaller than a pixel, which would
+        # otherwise be dropped and then flattened to sea level.
+        mask = rasterize(
+            ((geom, 1) for geom in land.geometry),
+            out_shape=(int(shape[0]), int(shape[1])),
+            transform=transform,
+            fill=0,
+            dtype="uint8",
+            all_touched=True,
+        ).astype(bool)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache, mask)
+    log.info("land covers %.2f%% of the bounding box; mask cached at %s", 100.0 * mask.mean(), cache)
+    return mask
+
+
+def apply_sea_level_model(
+    elev_map: np.ndarray,
+    land_mask: Optional[np.ndarray],
+    min_land_elevation_m: float,
+) -> np.ndarray:
+    """
+    Inputs:
+    - `elev_map`: the raster as loaded, with the DEM's own negative values.
+    - `land_mask`: True where the coastline says land, or `None` to flatten
+      everything below sea level as before.
+    - `min_land_elevation_m`: floor applied to land that lies below sea level.
+
+    Outputs:
+    - Returns the raster the printed surface is built from: sea flat at zero,
+      ground below sea level kept so it still shows relief.
+
+    Only samples the DEM already reads as negative are touched. Positive ground is
+    left exactly as it is, so a coastline that disagrees with the DEM by a few
+    pixels - which happens along every steep coast - can never flatten real relief.
+    """
+    out = np.array(elev_map, dtype=np.float32, copy=True)
+    below = np.isfinite(out) & (out < 0.0)
+    if land_mask is None:
+        out[below] = 0.0
+        return out
+    sea = below & ~land_mask
+    land_below = below & land_mask
+    out[sea] = 0.0
+    np.maximum(out, np.float32(min_land_elevation_m), out=out, where=land_below)
+    return out
+
+
 def effective_map_size_mm(args) -> tuple[float, float]:
     """
     Return the assembled map size in mm.
@@ -3457,6 +3600,19 @@ def load_raster_context(args, log: logging.Logger) -> RasterContext:
             eff_height_mm=float(eff_height_mm),
             nozzle_diameter_mm=_effective_nozzle_diameter_mm(args),
         )
+    land_mask = build_land_mask(args, elev_map.shape, log)
+    terrain_elev_map = apply_sea_level_model(
+        elev_map, land_mask, float(args.min_land_elevation_m)
+    )
+    if land_mask is not None:
+        below = np.isfinite(terrain_elev_map) & (terrain_elev_map < 0.0)
+        log.info(
+            "sea flattened to zero; %d samples of land below sea level kept (down to %.1f m)",
+            int(below.sum()),
+            float(terrain_elev_map[below].min()) if below.any() else 0.0,
+        )
+    # The corridor solver keeps the old fully clamped view so the cut lines, and
+    # therefore every seam on the already printed tiles, stay exactly as they were.
     elev_map = _clamp_nonnegative(elev_map)
     img_h, img_w = elev_map.shape
     log.info(
@@ -3471,6 +3627,8 @@ def load_raster_context(args, log: logging.Logger) -> RasterContext:
 
     return RasterContext(
         elev_map=elev_map,
+        terrain_elev_map=terrain_elev_map,
+        land_mask=land_mask,
         img_h=img_h,
         img_w=img_w,
         bbox_w_m=float(bbox_w_m),
@@ -4491,8 +4649,11 @@ def export_tile_meshes(
     z_max = args.bottom_thickness_mm + args.desired_height_mm + 1.0
     nx = len(plan.col_starts_px)
     ny = len(plan.row_starts_px)
-    global_h_min = float(np.nanmin(ctx.elev_map))
-    global_h_max = float(np.nanmax(ctx.elev_map))
+    # Anchor the mapping at sea level rather than at the lowest sample, so every
+    # height above water keeps the Z it has always had and only ground below sea
+    # level moves. Without this the whole map would rescale.
+    global_h_min = 0.0
+    global_h_max = float(np.nanmax(ctx.terrain_elev_map))
     if not np.isfinite(global_h_min) or not np.isfinite(global_h_max):
         raise RuntimeError("Cannot export meshes because the global elevation range is invalid")
     col_starts_mm = plan.col_starts_mm
@@ -4526,6 +4687,16 @@ def export_tile_meshes(
         return float(args.fitting_clearance) / 2.0
 
     git_commit = _current_git_commit()
+    if ctx.land_mask is None:
+        coastline_note = None
+    else:
+        archive = Path(str(args.coastline_dir)).expanduser() / COASTLINE_ARCHIVE_NAME
+        stamp = (
+            time.strftime("%Y-%m-%d", time.gmtime(archive.stat().st_mtime))
+            if archive.exists()
+            else "unknown"
+        )
+        coastline_note = f"OSM land polygons (ODbL), build {stamp}"
     metadata: dict[tuple[int, int], tuple[str, str]] = {}
     tasks: list[dict] = []
     for ty in range(ny):
@@ -4606,6 +4777,11 @@ def export_tile_meshes(
                         },
                         "mm_per_px": {"x": float(ctx.mm_per_px_x), "y": float(ctx.mm_per_px_y)},
                         "elevation_range_m": {"min": float(global_h_min), "max": float(global_h_max)},
+                        "sea_level_model": {
+                            "coastline": coastline_note,
+                            "min_land_elevation_m": float(args.min_land_elevation_m),
+                            "note": "sea flat at zero; land below sea level mirrors the height curve",
+                        },
                         "z_range_mm": {"min": float(z_min), "max": float(z_max)},
                         "print_scale": float(print_scale),
                         "effective_mm": {
@@ -4635,7 +4811,7 @@ def export_tile_meshes(
                     "out_path": str(out_path),
                     "mmap_path": None,
                     "shape": None,
-                    "dtype_str": str(ctx.elev_map.dtype),
+                    "dtype_str": str(ctx.terrain_elev_map.dtype),
                     "crop_x0_px": int(crop_x0_px),
                     "crop_x1_px": int(crop_x1_px),
                     "crop_y0_px": int(crop_y0_px),
@@ -4702,15 +4878,17 @@ def export_tile_meshes(
     tmp_dir = Path(tempfile.gettempdir())
     mmap_path = str(tmp_dir / f"depth_map_mesh_{os.getpid()}.mmap")
     with Timer("write export memmap", log):
-        mm = np.memmap(mmap_path, dtype=ctx.elev_map.dtype, mode="w+", shape=ctx.elev_map.shape)
-        mm[:] = ctx.elev_map
+        mm = np.memmap(
+            mmap_path, dtype=ctx.terrain_elev_map.dtype, mode="w+", shape=ctx.terrain_elev_map.shape
+        )
+        mm[:] = ctx.terrain_elev_map
         mm.flush()
         del mm
 
     try:
         for task in tasks:
             task["mmap_path"] = mmap_path
-            task["shape"] = ctx.elev_map.shape
+            task["shape"] = ctx.terrain_elev_map.shape
 
         with Timer("process tiles (boolean, multiprocessing)", log):
             ctx_mp = get_context("spawn")
