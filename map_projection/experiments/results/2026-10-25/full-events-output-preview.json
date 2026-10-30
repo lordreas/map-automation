@@ -1,0 +1,204 @@
+{
+  "synthetic": false,
+  "variant": "baseline",
+  "cache": "/home/map/map-projection-staging/events",
+  "setup_seconds": 7.1679490319984325,
+  "output": {
+    "driver": "kmsdrm",
+    "drawable": [
+      3840,
+      2160
+    ],
+    "active_mode": [
+      3840,
+      2160,
+      60
+    ],
+    "renderer": "PowerVR B-Series BXM-4-64",
+    "graphics_api": "OpenGL ES 3.2 build 24.2@6603887",
+    "accelerated": true,
+    "pixel_buffer_verified": true,
+    "direct_scanout": true,
+    "projector_pixels_verified": false,
+    "displays": [
+      {
+        "index": 0,
+        "name": "0",
+        "modes": [
+          {
+            "width": 3840,
+            "height": 2160,
+            "refresh": 60
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "refresh": 50
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "refresh": 30
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "refresh": 25
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "refresh": 24
+          },
+          {
+            "width": 3840,
+            "height": 1080,
+            "refresh": 60
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "refresh": 60
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "refresh": 50
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "refresh": 30
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "refresh": 25
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "refresh": 24
+          },
+          {
+            "width": 1440,
+            "height": 900,
+            "refresh": 60
+          },
+          {
+            "width": 1280,
+            "height": 1024,
+            "refresh": 60
+          },
+          {
+            "width": 1280,
+            "height": 800,
+            "refresh": 60
+          },
+          {
+            "width": 1280,
+            "height": 720,
+            "refresh": 60
+          },
+          {
+            "width": 1280,
+            "height": 720,
+            "refresh": 50
+          },
+          {
+            "width": 1024,
+            "height": 768,
+            "refresh": 60
+          },
+          {
+            "width": 800,
+            "height": 600,
+            "refresh": 60
+          },
+          {
+            "width": 800,
+            "height": 600,
+            "refresh": 56
+          },
+          {
+            "width": 720,
+            "height": 576,
+            "refresh": 50
+          },
+          {
+            "width": 720,
+            "height": 480,
+            "refresh": 60
+          },
+          {
+            "width": 640,
+            "height": 480,
+            "refresh": 60
+          }
+        ]
+      }
+    ],
+    "note": "GPU shadows and native pixel output. Check physical alignment with calibration patterns."
+  },
+  "terrain_grid": [
+    4096,
+    2396
+  ],
+  "calibration": [
+    [
+      1.5258060265682332,
+      0.8505634787178451
+    ],
+    [
+      3838.474193973432,
+      11.850563478717845
+    ],
+    [
+      3744.8725061466903,
+      2159.6338051994235
+    ],
+    [
+      7.1274938533097725,
+      2155.6338051994235
+    ]
+  ],
+  "cases": [
+    {
+      "case": "sunset_with_browser_preview",
+      "minutes_per_second": 1,
+      "preview": true,
+      "frames": 587,
+      "elapsed_seconds": 19.969521924998844,
+      "fps": 29.344718526607085,
+      "interval_median_ms": 33.868743001221446,
+      "interval_p95_ms": 41.75652950016229,
+      "interval_max_ms": 108.29600899887737,
+      "intervals_over_25ms_fraction": 0.9863481228668942,
+      "present_median_ms": 22.95073300047079,
+      "submission_median_ms": 8.10537099823705,
+      "first_time": "2026-10-25T16:20:57.931160+01:00",
+      "last_time": "2026-10-25T16:40:56.465842+01:00"
+    }
+  ],
+  "http_requests": {
+    "preview": 27,
+    "state": 20,
+    "errors": 0
+  },
+  "peak_rss_KiB_linux": 696532,
+  "includes": [
+    "Engine worker",
+    "solar position",
+    "real daily cache updates",
+    "4096 terrain",
+    "current calibration",
+    "3840x2160 shading",
+    "SDL KMS/DRM HDMI swap at 60Hz",
+    "HTTP server",
+    "960x540 preview requests in final case"
+  ],
+  "excludes": [
+    "remote browser painting/network latency",
+    "physical optical verification"
+  ]
+}

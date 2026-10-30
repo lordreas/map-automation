@@ -1,0 +1,21 @@
+{
+  "native": {
+    "seconds": 27.118894829,
+    "events": 19658590,
+    "cells": 9814016,
+    "threads": 8,
+    "evaluated_states": 1398451380
+  },
+  "timestamp_max_difference_ms": 0,
+  "different_timestamps": 0,
+  "counts_histogram": {
+    "0": 31128,
+    "2": 9740551,
+    "4": 38743,
+    "6": 3177,
+    "8": 360,
+    "10": 55,
+    "12": 2
+  },
+  "sorted_monotonic": true
+}

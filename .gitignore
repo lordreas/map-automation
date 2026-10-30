@@ -1,15 +1,35 @@
+# Local dotfiles and directories; keep ignore rules versioned.
+.*
+!.gitignore
+
+# Logs
+*.log
+log/
+logs/
+
+# Downloaded and generated data
 allCountries_cache/
 elevation_tiles/
 tiles/
+coastline/
 __pycache__/
 
+# Map and slicer exports
 *.gpx
 *.pdf
 *.png
+*.stl
+*.obj
+*.3mf
+*.gcode
+/stl_files/
+/slice_out/
+/result.json
+exports/
+intersection_graphs/
+clearances_[0-9][0-9]_[0-9][0-9].csv
+params_[0-9][0-9]_[0-9][0-9].yaml
 
 # temp memmaps created by depth_map.py
 depth_map_elev_*.mmap
 *.mmap
-*.stl
-*.obj
-coastline/

@@ -1,0 +1,9 @@
+{
+  "indices": 4096,
+  "cold_query_ms": 662.0554850014742,
+  "warm_median_ms": 0.040208000427810475,
+  "warm_p95_ms": 0.041669097481644705,
+  "decoded_tile_bytes": 16400384,
+  "compressed_bytes": 4880619,
+  "iterations": 1000
+}

@@ -1,0 +1,50 @@
+{
+  "method": "fragment_compaction_and_hierarchical_compute_rays",
+  "renderer": "PowerVR B-Series BXM-4-64",
+  "output": [
+    3840,
+    2160
+  ],
+  "grid": [
+    2048,
+    1198
+  ],
+  "results": [
+    {
+      "time": "2026-10-25T16:00:00+01:00",
+      "altitude": 11.29439785389089,
+      "median_ms": 80.843,
+      "removed_false_highlights": 10537,
+      "exact_cpu_ray_checks": 128
+    },
+    {
+      "time": "2026-10-25T16:20:00+01:00",
+      "altitude": 8.238698455289608,
+      "median_ms": 82.14,
+      "removed_false_highlights": 13459,
+      "exact_cpu_ray_checks": 128
+    },
+    {
+      "time": "2026-10-25T16:40:00+01:00",
+      "altitude": 5.079018066568632,
+      "median_ms": 84.555,
+      "removed_false_highlights": 16508,
+      "exact_cpu_ray_checks": 128
+    },
+    {
+      "time": "2026-10-25T17:00:00+01:00",
+      "altitude": 1.8316646471094717,
+      "median_ms": 86.7,
+      "removed_false_highlights": 17396,
+      "exact_cpu_ray_checks": 128
+    },
+    {
+      "time": "2026-10-25T17:10:00+01:00",
+      "altitude": 0.17987849139889003,
+      "median_ms": 62.257,
+      "removed_false_highlights": 8015,
+      "exact_cpu_ray_checks": 128
+    }
+  ],
+  "repeated_frame_identical": true
+}

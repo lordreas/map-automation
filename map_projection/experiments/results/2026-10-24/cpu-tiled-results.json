@@ -1,0 +1,140 @@
+[
+  {
+    "grid": 512,
+    "threads": 1,
+    "prepare_seconds": 0.10291170800019245,
+    "baseline_ms": 323.53,
+    "stages_ms": {
+      "horizon": 1.25,
+      "lighting": 1.43,
+      "gather": 14.24,
+      "total": 16.39
+    },
+    "max_ms": 29.74,
+    "cpu_affinity": [
+      6,
+      7
+    ],
+    "max_grey_difference": 1,
+    "rendered_sun_times": [
+      "09:00",
+      "12:00",
+      "16:00"
+    ]
+  },
+  {
+    "grid": 512,
+    "threads": 2,
+    "prepare_seconds": 0.10291170800019245,
+    "baseline_ms": 323.53,
+    "stages_ms": {
+      "horizon": 1.16,
+      "lighting": 0.83,
+      "gather": 7.1,
+      "total": 9.2
+    },
+    "max_ms": 9.22,
+    "cpu_affinity": [
+      6,
+      7
+    ],
+    "max_grey_difference": 1,
+    "rendered_sun_times": [
+      "09:00",
+      "12:00",
+      "16:00"
+    ]
+  },
+  {
+    "grid": 1024,
+    "threads": 1,
+    "prepare_seconds": 0.11063429100022404,
+    "baseline_ms": 339.24,
+    "stages_ms": {
+      "horizon": 4.94,
+      "lighting": 5.25,
+      "gather": 14.17,
+      "total": 24.5
+    },
+    "max_ms": 37.9,
+    "cpu_affinity": [
+      6,
+      7
+    ],
+    "max_grey_difference": 0,
+    "rendered_sun_times": [
+      "09:00",
+      "12:00",
+      "16:00"
+    ]
+  },
+  {
+    "grid": 1024,
+    "threads": 2,
+    "prepare_seconds": 0.11063429100022404,
+    "baseline_ms": 339.24,
+    "stages_ms": {
+      "horizon": 4.76,
+      "lighting": 2.93,
+      "gather": 7.82,
+      "total": 15.69
+    },
+    "max_ms": 15.81,
+    "cpu_affinity": [
+      6,
+      7
+    ],
+    "max_grey_difference": 0,
+    "rendered_sun_times": [
+      "09:00",
+      "12:00",
+      "16:00"
+    ]
+  },
+  {
+    "grid": 2048,
+    "threads": 1,
+    "prepare_seconds": 0.15518050000036965,
+    "baseline_ms": 465.09,
+    "stages_ms": {
+      "horizon": 20.49,
+      "lighting": 20.95,
+      "gather": 17.61,
+      "total": 57.8
+    },
+    "max_ms": 73.1,
+    "cpu_affinity": [
+      6,
+      7
+    ],
+    "max_grey_difference": 1,
+    "rendered_sun_times": [
+      "09:00",
+      "12:00",
+      "16:00"
+    ]
+  },
+  {
+    "grid": 2048,
+    "threads": 2,
+    "prepare_seconds": 0.15518050000036965,
+    "baseline_ms": 465.09,
+    "stages_ms": {
+      "horizon": 21.02,
+      "lighting": 11.16,
+      "gather": 10.75,
+      "total": 42.9
+    },
+    "max_ms": 43.52,
+    "cpu_affinity": [
+      6,
+      7
+    ],
+    "max_grey_difference": 1,
+    "rendered_sun_times": [
+      "09:00",
+      "12:00",
+      "16:00"
+    ]
+  }
+]

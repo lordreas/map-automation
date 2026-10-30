@@ -1,0 +1,7 @@
+{
+  "cells": 65536,
+  "seconds": 308.36399030699977,
+  "events": 131230,
+  "peak_rss_KiB_linux": 375956,
+  "qualification": "One full-width terrain stripe; not a full-board daily generation benchmark."
+}

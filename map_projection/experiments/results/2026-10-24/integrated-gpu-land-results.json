@@ -1,0 +1,40 @@
+{
+  "renderer": "PowerVR B-Series BXM-4-64",
+  "version": "OpenGL ES 3.2 build 24.2@6603887",
+  "grid": [
+    2048,
+    1198
+  ],
+  "output": [
+    3840,
+    2160
+  ],
+  "frames": 100,
+  "median_ms": 36.374,
+  "p95_ms": 42.96,
+  "full_capture_byte_difference": 0,
+  "day_night_recovery": true,
+  "negative_land_cells": 25377,
+  "per_sun": [
+    {
+      "hour": "09",
+      "median_ms": 38.167,
+      "max_ms": 42.416
+    },
+    {
+      "hour": "12",
+      "median_ms": 32.379,
+      "max_ms": 32.865
+    },
+    {
+      "hour": "16",
+      "median_ms": 42.9,
+      "max_ms": 43.244
+    },
+    {
+      "hour": "18",
+      "median_ms": 35.01,
+      "max_ms": 35.31
+    }
+  ]
+}

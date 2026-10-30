@@ -1,0 +1,23 @@
+{
+  "date": "2026-10-28",
+  "threads": 4,
+  "command_seconds": 362.4928867810004,
+  "seconds_including_storage_flush": 362.5941117950001,
+  "native": {
+    "seconds": 361.425392553,
+    "events": 19650388,
+    "cells": 9814016,
+    "threads": 4,
+    "evaluated_states": 1400175720
+  },
+  "peak_child_rss_KiB": 430404,
+  "bytes": 284876130,
+  "sha256": {
+    "initial.npy": "26829b8429846c2a11821872ef79169d7065230e8dd599b6d2ec884ce19c3aaf",
+    "offsets.npy": "71da555b3b668819d08afa68da96d646617633725aa2d602af87be35b7893113",
+    "times.npy": "a7832b74f61be825ec189005e54152e3e188d782c0f8992eb9a9d0b4bad54e96",
+    "sorted-times.npy": "379a758d346bb3cfa35af4ea3d594a124315d1ff832df4a42a766e6703def319",
+    "sorted-cells.npy": "34e71f9e7fffedb92a7ea0477a06c88895e9a78cf722bc499196e2a772887b77"
+  },
+  "matches_laptop_reference_all_arrays": true
+}

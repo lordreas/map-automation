@@ -1,0 +1,23 @@
+{
+  "native": {
+    "seconds": 209.363728949,
+    "events": 19658590,
+    "cells": 9814016,
+    "threads": 4,
+    "evaluated_states": 1398451380
+  },
+  "comparison": {
+    "initial.npy": {
+      "different": 0,
+      "max_difference": 0
+    },
+    "offsets.npy": {
+      "different": 0,
+      "max_difference": 0
+    },
+    "times.npy": {
+      "different": 0,
+      "max_difference": 0
+    }
+  }
+}

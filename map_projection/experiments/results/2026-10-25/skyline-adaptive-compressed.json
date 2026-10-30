@@ -1,0 +1,32 @@
+{
+  "0.00035": {
+    "projected_GB": 9.098701581,
+    "sample_bytes": 15189819,
+    "sample_profiles": 16384
+  },
+  "0.001": {
+    "projected_GB": 8.41341024,
+    "sample_bytes": 14045760,
+    "sample_profiles": 16384
+  },
+  "0.005": {
+    "projected_GB": 6.987527279,
+    "sample_bytes": 11665321,
+    "sample_profiles": 16384
+  },
+  "0.01": {
+    "projected_GB": 6.011153086,
+    "sample_bytes": 10035314,
+    "sample_profiles": 16384
+  },
+  "0.05": {
+    "projected_GB": 2.88799464,
+    "sample_bytes": 4821360,
+    "sample_profiles": 16384
+  },
+  "0.1": {
+    "projected_GB": 1.846604388,
+    "sample_bytes": 3082812,
+    "sample_profiles": 16384
+  }
+}

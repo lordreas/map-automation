@@ -1,0 +1,44 @@
+{
+  "manifest": {
+    "schema": 1,
+    "key": "95a1492c10334a2570f63ed27d841e55726c14509f1f13dfb8ac02f79481294a",
+    "angles": 1001,
+    "shape": [
+      2396,
+      4096
+    ],
+    "physical": [
+      888855.0851653167,
+      544731.7247258342
+    ],
+    "bias": 29.636406845425565,
+    "elevation_precision_degrees": 0.00034332275390625,
+    "angular_step_degrees": 0.25,
+    "complete": true,
+    "completed": 1440,
+    "interval_certified": false,
+    "storage": "zstd-predict-v2",
+    "azimuth_start": 55.0,
+    "azimuth_end": 305.0,
+    "tile_shape": [
+      16,
+      256
+    ],
+    "level": 6,
+    "lossless_relative_to": "source float32 samples",
+    "bytes": 9598187442,
+    "generation_seconds": 942.1127885500027
+  },
+  "total_bytes": 9598245825,
+  "tiles": 2400,
+  "coded_tiles": 2400,
+  "fallback_tiles": 0,
+  "zero_height_cells": 1097048,
+  "cells": 9814016,
+  "daily_event_bytes": 284974271,
+  "sha256": {
+    "tiles.zst": "31eec28b072f625107004c1a7a28bc030dc00a5f596b499c86f73aaf55ffca23",
+    "index.npy": "2ac510e66935f0b647981e2c4b38ef6f1a32476186803481291ecadb70d3ebb0",
+    "manifest.json": "17ed08c6a25a35c60c0c5e55870b3c11d5b54d3884c8a14c4cd3d90c84a71336"
+  }
+}

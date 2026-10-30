@@ -1,0 +1,10 @@
+{
+  "declination_bound_degrees": 24,
+  "sea_or_land_independent": true,
+  "sample_values": 65601536,
+  "removable_vertex_fraction": 0.39531075918710196,
+  "always_lit_interval_fraction": 0.35989019775390624,
+  "always_shadowed_interval_fraction": 0.0368037109375,
+  "projected_GB": 6.2891073555,
+  "qualification": "Visibility equivalent only inside the declared annual sun band, relative to the existing piecewise-linear skyline bank. Not lossless general skyline data."
+}

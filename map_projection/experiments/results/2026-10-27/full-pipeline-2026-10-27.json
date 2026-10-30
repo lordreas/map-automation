@@ -1,0 +1,353 @@
+{
+  "synthetic": false,
+  "thermal_start": {
+    "cpul_idle_zone": 78.647,
+    "cpul_thermal_zone": 79.355,
+    "skin_zone": 39.871,
+    "npu_thermal_zone": 77.703,
+    "cpub_idle_zone": 79.355,
+    "cpub_thermal_zone": 78.647,
+    "ddr_thermal_zone": 78.765,
+    "gpu_thermal_zone": 79.06,
+    "policy6_max_kHz": 2002000,
+    "policy0_max_kHz": 1794000
+  },
+  "thermal_end": {
+    "cpul_idle_zone": 84.37,
+    "cpul_thermal_zone": 84.842,
+    "skin_zone": 40.968,
+    "npu_thermal_zone": 82.069,
+    "cpub_idle_zone": 84.842,
+    "cpub_thermal_zone": 84.37,
+    "ddr_thermal_zone": 83.662,
+    "gpu_thermal_zone": 84.37,
+    "policy6_max_kHz": 416000,
+    "policy0_max_kHz": 416000
+  },
+  "date": "2026-10-27",
+  "preview_width": 960,
+  "switch_interval": 0.001,
+  "variant": "baseline",
+  "cache": "/home/map/map-automation/map_projection/.cache/events",
+  "setup_seconds": 5.611384324000028,
+  "output": {
+    "driver": "kmsdrm",
+    "drawable": [
+      3840,
+      2160
+    ],
+    "active_mode": [
+      3840,
+      2160,
+      60
+    ],
+    "renderer": "PowerVR B-Series BXM-4-64",
+    "graphics_api": "OpenGL ES 3.2 build 24.2@6603887",
+    "accelerated": true,
+    "pixel_buffer_verified": true,
+    "direct_scanout": true,
+    "projector_pixels_verified": false,
+    "displays": [
+      {
+        "index": 0,
+        "name": "0",
+        "modes": [
+          {
+            "width": 3840,
+            "height": 2160,
+            "refresh": 60
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "refresh": 50
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "refresh": 30
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "refresh": 25
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "refresh": 24
+          },
+          {
+            "width": 3840,
+            "height": 1080,
+            "refresh": 60
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "refresh": 60
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "refresh": 50
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "refresh": 30
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "refresh": 25
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "refresh": 24
+          },
+          {
+            "width": 1440,
+            "height": 900,
+            "refresh": 60
+          },
+          {
+            "width": 1280,
+            "height": 1024,
+            "refresh": 60
+          },
+          {
+            "width": 1280,
+            "height": 800,
+            "refresh": 60
+          },
+          {
+            "width": 1280,
+            "height": 720,
+            "refresh": 60
+          },
+          {
+            "width": 1280,
+            "height": 720,
+            "refresh": 50
+          },
+          {
+            "width": 1024,
+            "height": 768,
+            "refresh": 60
+          },
+          {
+            "width": 800,
+            "height": 600,
+            "refresh": 60
+          },
+          {
+            "width": 800,
+            "height": 600,
+            "refresh": 56
+          },
+          {
+            "width": 720,
+            "height": 576,
+            "refresh": 50
+          },
+          {
+            "width": 720,
+            "height": 480,
+            "refresh": 60
+          },
+          {
+            "width": 640,
+            "height": 480,
+            "refresh": 60
+          }
+        ]
+      }
+    ],
+    "note": "GPU shadows and native pixel output. Check physical alignment with calibration patterns."
+  },
+  "terrain_grid": [
+    4096,
+    2396
+  ],
+  "calibration": [
+    [
+      1.5258060265682332,
+      0.8505634787178451
+    ],
+    [
+      3838.474193973432,
+      11.850563478717845
+    ],
+    [
+      3744.8725061466903,
+      2159.6338051994235
+    ],
+    [
+      7.1274938533097725,
+      2155.6338051994235
+    ]
+  ],
+  "cases": [
+    {
+      "case": "sunset_1_min_per_second",
+      "minutes_per_second": 1,
+      "preview": false,
+      "frames": 361,
+      "elapsed_seconds": 11.984080622999954,
+      "fps": 30.039851309835548,
+      "interval_median_ms": 33.45692849984516,
+      "interval_p95_ms": 34.206665350188814,
+      "interval_max_ms": 35.16502999991644,
+      "intervals_over_25ms_fraction": 1.0,
+      "present_median_ms": 23.840338999889354,
+      "submission_median_ms": 4.410035000091739,
+      "first_time": "2026-10-27T16:20:57.115826+01:00",
+      "last_time": "2026-10-27T16:32:56.164939+01:00",
+      "daylight_fps": 30.03985130983555,
+      "daylight_interval_p95_ms": 34.206665350188814,
+      "daylight_frames": 361
+    },
+    {
+      "case": "sunset_15_min_per_second",
+      "minutes_per_second": 15,
+      "preview": false,
+      "frames": 480,
+      "elapsed_seconds": 11.968123685999672,
+      "fps": 40.02298209537514,
+      "interval_median_ms": 18.05293100005656,
+      "interval_p95_ms": 36.560127299844666,
+      "interval_max_ms": 136.13650200022676,
+      "intervals_over_25ms_fraction": 0.453027139874739,
+      "present_median_ms": 11.53667000016867,
+      "submission_median_ms": 1.130935999981375,
+      "first_time": "2026-10-27T15:14:30.633261+01:00",
+      "last_time": "2026-10-27T18:14:14.817860+01:00",
+      "daylight_fps": 28.513661431779916,
+      "daylight_interval_p95_ms": 46.57751299987467,
+      "daylight_frames": 216
+    },
+    {
+      "case": "day_60_min_per_second",
+      "minutes_per_second": 60,
+      "preview": false,
+      "frames": 410,
+      "elapsed_seconds": 11.942517139999836,
+      "fps": 34.247386476851695,
+      "interval_median_ms": 33.08490800009167,
+      "interval_p95_ms": 34.71848100007264,
+      "interval_max_ms": 52.33800399992106,
+      "intervals_over_25ms_fraction": 0.7310513447432763,
+      "present_median_ms": 18.187264000061987,
+      "submission_median_ms": 2.787578999914331,
+      "first_time": "2026-10-27T07:01:14.242952+01:00",
+      "last_time": "2026-10-27T19:00:03.053103+01:00",
+      "daylight_fps": 29.61055164026711,
+      "daylight_interval_p95_ms": 34.85750784991524,
+      "daylight_frames": 299
+    },
+    {
+      "case": "sunset_with_browser_preview",
+      "minutes_per_second": 1,
+      "preview": true,
+      "frames": 344,
+      "elapsed_seconds": 11.96811601699983,
+      "fps": 28.65948153517176,
+      "interval_median_ms": 33.63011600004029,
+      "interval_p95_ms": 45.72213519991236,
+      "interval_max_ms": 51.59008900000117,
+      "intervals_over_25ms_fraction": 1.0,
+      "present_median_ms": 19.07457549987157,
+      "submission_median_ms": 6.634677499960162,
+      "first_time": "2026-10-27T16:20:57.937165+01:00",
+      "last_time": "2026-10-27T16:32:56.065430+01:00",
+      "daylight_fps": 28.659481535171757,
+      "daylight_interval_p95_ms": 45.72213519991236,
+      "daylight_frames": 344
+    }
+  ],
+  "transitions": [
+    {
+      "kind": "now",
+      "trial": 0,
+      "frames": 49,
+      "duration_seconds": 1.0785517879999134,
+      "interval_p95_ms": 42.72869409999201,
+      "interval_max_ms": 74.50305399970603,
+      "first_time": "2026-10-27T16:20:00+01:00",
+      "last_time": "2026-10-27T21:52:05.924821+01:00"
+    },
+    {
+      "kind": "now",
+      "trial": 1,
+      "frames": 48,
+      "duration_seconds": 1.0608997320000526,
+      "interval_p95_ms": 45.89345179997503,
+      "interval_max_ms": 80.01158700017186,
+      "first_time": "2026-10-27T16:20:00+01:00",
+      "last_time": "2026-10-27T21:52:07.106342+01:00"
+    },
+    {
+      "kind": "now",
+      "trial": 2,
+      "frames": 42,
+      "duration_seconds": 1.0670789720002176,
+      "interval_p95_ms": 36.300778000168066,
+      "interval_max_ms": 98.8408929997604,
+      "first_time": "2026-10-27T16:20:00+01:00",
+      "last_time": "2026-10-27T21:52:08.336633+01:00"
+    },
+    {
+      "kind": "stop_return",
+      "trial": 0,
+      "frames": 42,
+      "duration_seconds": 1.0542829080000047,
+      "interval_p95_ms": 50.44192400009706,
+      "interval_max_ms": 56.321831999866845,
+      "first_time": "2026-10-27T17:46:54.129527+01:00",
+      "last_time": "2026-10-27T16:20:00+01:00"
+    },
+    {
+      "kind": "stop_return",
+      "trial": 1,
+      "frames": 41,
+      "duration_seconds": 1.0513897040000302,
+      "interval_p95_ms": 57.80032940017456,
+      "interval_max_ms": 88.32094999979745,
+      "first_time": "2026-10-27T17:46:56.092423+01:00",
+      "last_time": "2026-10-27T16:20:00+01:00"
+    },
+    {
+      "kind": "stop_return",
+      "trial": 2,
+      "frames": 39,
+      "duration_seconds": 1.0778236229998583,
+      "interval_p95_ms": 60.24229709996686,
+      "interval_max_ms": 101.34030499966684,
+      "first_time": "2026-10-27T17:47:09.720357+01:00",
+      "last_time": "2026-10-27T16:20:00+01:00"
+    }
+  ],
+  "http_requests": {
+    "preview": 32,
+    "state": 22,
+    "errors": 0
+  },
+  "peak_rss_KiB_linux": 562316,
+  "includes": [
+    "Engine worker",
+    "solar position",
+    "real daily cache updates",
+    "4096 terrain",
+    "current calibration",
+    "3840x2160 shading",
+    "SDL KMS/DRM HDMI swap at 60Hz",
+    "HTTP server",
+    "960x540 preview requests in final case"
+  ],
+  "excludes": [
+    "remote browser painting/network latency",
+    "physical optical verification"
+  ]
+}

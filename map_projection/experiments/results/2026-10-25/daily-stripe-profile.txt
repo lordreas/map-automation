@@ -1,0 +1,41 @@
+         45661338 function calls (45661275 primitive calls) in 141.792 seconds
+
+   Ordered by: cumulative time
+   List reduced from 287 to 35 due to restriction <35>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    6.437    6.437  141.792  141.792 /mnt/Data/git/map-automation/map_projection/horizon_cache.py:54(build_day)
+   306366   79.398    0.000  112.724    0.000 /mnt/Data/git/map-automation/map_projection/skyline_store.py:93(at)
+   374154    0.541    0.000   16.696    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/lib/arraysetops.py:138(unique)
+   374154    3.105    0.000   15.821    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/lib/arraysetops.py:323(_unique1d)
+  1181633    1.742    0.000   12.415    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/numeric.py:615(flatnonzero)
+   355566    4.778    0.000   12.113    0.000 /mnt/Data/git/map-automation/map_projection/solar.py:13(position)
+   374154   11.828    0.000   11.828    0.000 {method 'sort' of 'numpy.ndarray' objects}
+  1537233    1.169    0.000   11.827    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/fromnumeric.py:53(_wrapfunc)
+  1181633    0.501    0.000    8.478    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/fromnumeric.py:1881(nonzero)
+  1181633    7.067    0.000    7.067    0.000 {method 'nonzero' of 'numpy.ndarray' objects}
+    65538    4.031    0.000    4.091    0.000 {method 'tofile' of 'numpy.ndarray' objects}
+  1655931    0.660    0.000    3.799    0.000 /mnt/Data/git/map-automation/map_projection/skyline_store.py:83(tile)
+   355566    0.325    0.000    3.009    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/fromnumeric.py:2100(clip)
+       16    0.571    0.036    2.161    0.135 /mnt/Data/git/map-automation/map_projection/skyline_store.py:65(decode_predicted)
+   355566    0.773    0.000    2.133    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/fromnumeric.py:40(_wrapit)
+  1181633    1.052    0.000    1.885    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/fromnumeric.py:1768(ravel)
+   257345    1.737    0.000    1.737    0.000 {method 'copy' of 'numpy.ndarray' objects}
+   306365    0.965    0.000    1.599    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/numeric.py:2378(array_equal)
+   355566    0.239    0.000    1.149    0.000 {method 'clip' of 'numpy.ndarray' objects}
+       32    0.000    0.000    1.146    0.036 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/fromnumeric.py:2512(cumsum)
+       32    1.146    0.036    1.146    0.036 {method 'cumsum' of 'numpy.ndarray' objects}
+   355566    0.298    0.000    1.027    0.000 /usr/lib/python3.12/re/__init__.py:179(sub)
+   355567    0.940    0.000    0.940    0.000 {method 'isoformat' of 'datetime.datetime' objects}
+   355566    0.910    0.000    0.910    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/_methods.py:90(_clip)
+   140190    0.198    0.000    0.841    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/fromnumeric.py:2692(max)
+   355566    0.748    0.000    0.748    0.000 {method 'timetuple' of 'datetime.datetime' objects}
+  4266792    0.676    0.000    0.676    0.000 {built-in method math.cos}
+   283427    0.661    0.000    0.661    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+   140191    0.297    0.000    0.643    0.000 /mnt/Data/git/map-automation/.venv/lib/python3.12/site-packages/numpy/core/fromnumeric.py:71(_wrapreduction)
+   374154    0.642    0.000    0.642    0.000 {method 'flatten' of 'numpy.ndarray' objects}
+       16    0.336    0.021    0.558    0.035 /mnt/Data/git/map-automation/map_projection/skyline_store.py:28(decompress)
+  3555660    0.540    0.000    0.540    0.000 {built-in method math.sin}
+   143220    0.114    0.000    0.522    0.000 {method 'all' of 'numpy.ndarray' objects}
+   472392    0.519    0.000    0.519    0.000 {built-in method numpy.array}
+  1530149    0.507    0.000    0.507    0.000 {built-in method numpy.asarray}

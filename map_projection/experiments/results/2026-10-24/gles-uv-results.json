@@ -1,0 +1,44 @@
+[
+  {
+    "cpu_shadow_ms": 106.024,
+    "upload_ms": 3.572,
+    "gpu_lighting_ms": 34.192,
+    "gpu_4k_ms": 34.008,
+    "total_ms": 177.796
+  },
+  {
+    "cpu_shadow_ms": 100.163,
+    "upload_ms": 7.698,
+    "gpu_lighting_ms": 8.128,
+    "gpu_4k_ms": 9.661,
+    "total_ms": 125.651
+  },
+  {
+    "cpu_shadow_ms": 97.282,
+    "upload_ms": 6.98,
+    "gpu_lighting_ms": 8.635,
+    "gpu_4k_ms": 9.743,
+    "total_ms": 122.64
+  },
+  {
+    "cpu_shadow_ms": 97.507,
+    "upload_ms": 7.343,
+    "gpu_lighting_ms": 8.959,
+    "gpu_4k_ms": 9.72,
+    "total_ms": 123.53
+  },
+  {
+    "cpu_shadow_ms": 97.84,
+    "upload_ms": 7.664,
+    "gpu_lighting_ms": 8.793,
+    "gpu_4k_ms": 9.908,
+    "total_ms": 124.205
+  },
+  {
+    "cpu_shadow_ms": 97.186,
+    "upload_ms": 7.498,
+    "gpu_lighting_ms": 8.767,
+    "gpu_4k_ms": 9.505,
+    "total_ms": 122.956
+  }
+]

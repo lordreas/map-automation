@@ -1,0 +1,140 @@
+{
+  "renderer": "PowerVR B-Series BXM-4-64",
+  "results": [
+    {
+      "grid": [
+        512,
+        300
+      ],
+      "output": [
+        3840,
+        2160
+      ],
+      "method": "gpu_serial_sheared_scan",
+      "frames": 20,
+      "medians_ms": {
+        "gpu_shadow": 1.548,
+        "gpu_lighting": 1.863,
+        "gpu_4k_gather": 8.622,
+        "total": 11.896
+      },
+      "p95_total_ms": 12.727,
+      "validation": [
+        {
+          "hour": "09",
+          "cpu_shear_mask_mismatches": 0,
+          "production_mask_difference_percent": 0.4447,
+          "cast_shadow_pixels": 6265
+        },
+        {
+          "hour": "12",
+          "cpu_shear_mask_mismatches": 0,
+          "production_mask_difference_percent": 0.0033,
+          "cast_shadow_pixels": 17
+        },
+        {
+          "hour": "16",
+          "cpu_shear_mask_mismatches": 0,
+          "production_mask_difference_percent": 0.1621,
+          "cast_shadow_pixels": 450
+        },
+        {
+          "hour": "18",
+          "cpu_shear_mask_mismatches": 0,
+          "production_mask_difference_percent": 2.5195,
+          "cast_shadow_pixels": 44034
+        }
+      ]
+    },
+    {
+      "grid": [
+        1024,
+        599
+      ],
+      "output": [
+        3840,
+        2160
+      ],
+      "method": "gpu_serial_sheared_scan",
+      "frames": 20,
+      "medians_ms": {
+        "gpu_shadow": 4.856,
+        "gpu_lighting": 5.781,
+        "gpu_4k_gather": 8.971,
+        "total": 19.636
+      },
+      "p95_total_ms": 21.539,
+      "validation": [
+        {
+          "hour": "09",
+          "cpu_shear_mask_mismatches": 0,
+          "production_mask_difference_percent": 0.622,
+          "cast_shadow_pixels": 46437
+        },
+        {
+          "hour": "12",
+          "cpu_shear_mask_mismatches": 41,
+          "production_mask_difference_percent": 0.0355,
+          "cast_shadow_pixels": 1011
+        },
+        {
+          "hour": "16",
+          "cpu_shear_mask_mismatches": 1,
+          "production_mask_difference_percent": 0.4037,
+          "cast_shadow_pixels": 8180
+        },
+        {
+          "hour": "18",
+          "cpu_shear_mask_mismatches": 2,
+          "production_mask_difference_percent": 2.1944,
+          "cast_shadow_pixels": 210574
+        }
+      ]
+    },
+    {
+      "grid": [
+        2048,
+        1198
+      ],
+      "output": [
+        3840,
+        2160
+      ],
+      "method": "gpu_serial_sheared_scan",
+      "frames": 20,
+      "medians_ms": {
+        "gpu_shadow": 20.641,
+        "gpu_lighting": 22.361,
+        "gpu_4k_gather": 9.61,
+        "total": 52.496
+      },
+      "p95_total_ms": 61.406,
+      "validation": [
+        {
+          "hour": "09",
+          "cpu_shear_mask_mismatches": 8,
+          "production_mask_difference_percent": 0.6867,
+          "cast_shadow_pixels": 256782
+        },
+        {
+          "hour": "12",
+          "cpu_shear_mask_mismatches": 0,
+          "production_mask_difference_percent": 0.0715,
+          "cast_shadow_pixels": 12430
+        },
+        {
+          "hour": "16",
+          "cpu_shear_mask_mismatches": 4,
+          "production_mask_difference_percent": 0.4525,
+          "cast_shadow_pixels": 67648
+        },
+        {
+          "hour": "18",
+          "cpu_shear_mask_mismatches": 6,
+          "production_mask_difference_percent": 1.8533,
+          "cast_shadow_pixels": 934041
+        }
+      ]
+    }
+  ]
+}

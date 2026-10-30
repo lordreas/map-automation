@@ -1,0 +1,43 @@
+{
+  "renderer": "PowerVR B-Series BXM-4-64",
+  "grid": [
+    512,
+    299
+  ],
+  "frames": 121,
+  "step_seconds": 20,
+  "start": "2026-10-25T16:20:00+01:00",
+  "reference_surface": "continuous bilinear DEM / point sun",
+  "bias_metres": 47.41825095268091,
+  "terrain_sha256": "740d77acfa820086f95ef8228f1a2ac90d019d416103a59f5ff1edb95b90645d",
+  "timed_output": [
+    512,
+    299
+  ],
+  "different_classifications": 418056,
+  "classification_error_fraction": 0.022568772630531524,
+  "oracle_checks": 448,
+  "oracle_mismatches": 0,
+  "fast": {
+    "median_ms": 7.41818850110576,
+    "shadow_transitions": 246137,
+    "pixels_with_multiple_transitions": 28123,
+    "pixels_with_four_or_more_transitions": 19368,
+    "max_transitions": 98
+  },
+  "reference": {
+    "median_ms": 30.301340500045626,
+    "shadow_transitions": 36266,
+    "pixels_with_multiple_transitions": 0,
+    "pixels_with_four_or_more_transitions": 0,
+    "max_transitions": 1
+  },
+  "raw_scan": {
+    "median_ms": null,
+    "shadow_transitions": 261984,
+    "pixels_with_multiple_transitions": 29476,
+    "pixels_with_four_or_more_transitions": 20567,
+    "max_transitions": 98
+  },
+  "fast_reversals_where_reference_constant": 4784
+}

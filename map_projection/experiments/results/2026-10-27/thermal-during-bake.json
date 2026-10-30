@@ -1,0 +1,42 @@
+{
+  "thermal": {
+    "cpul_idle_zone": 87.615,
+    "cpul_thermal_zone": 89.149,
+    "skin_zone": 41.829,
+    "npu_thermal_zone": 83.485,
+    "cpub_idle_zone": 89.149,
+    "cpub_thermal_zone": 87.615,
+    "ddr_thermal_zone": 85.786,
+    "gpu_thermal_zone": 85.668
+  },
+  "cpu": {
+    "policy6": {
+      "scaling_cur_freq": 416000,
+      "scaling_max_freq": 416000,
+      "cpuinfo_max_freq": 2002000
+    },
+    "policy0": {
+      "scaling_cur_freq": 416000,
+      "scaling_max_freq": 416000,
+      "cpuinfo_max_freq": 1794000
+    }
+  },
+  "cooling": {
+    "cpufreq-cpu6": {
+      "cur_state": 11,
+      "max_state": 11
+    },
+    "devfreq-3600000.npu": {
+      "cur_state": 0,
+      "max_state": 2
+    },
+    "cpufreq-cpu0": {
+      "cur_state": 8,
+      "max_state": 8
+    },
+    "pwm-fan": {
+      "cur_state": 4,
+      "max_state": 4
+    }
+  }
+}

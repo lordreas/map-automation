@@ -1,0 +1,29 @@
+{
+  "renderer": "PowerVR B-Series BXM-4-64",
+  "grid": [
+    2048,
+    1198
+  ],
+  "frames": 121,
+  "step_seconds": 20,
+  "start": "2026-10-25T16:20:00+01:00",
+  "different_classifications": 4142118,
+  "classification_error_fraction": 0.0139524452233578,
+  "oracle_checks": 448,
+  "oracle_mismatches": 0,
+  "fast": {
+    "median_ms": 76.97400200049742,
+    "shadow_transitions": 2276512,
+    "pixels_with_multiple_transitions": 284256,
+    "pixels_with_four_or_more_transitions": 157218,
+    "max_transitions": 105
+  },
+  "reference": {
+    "median_ms": 627.7462765001474,
+    "shadow_transitions": 635259,
+    "pixels_with_multiple_transitions": 297,
+    "pixels_with_four_or_more_transitions": 3,
+    "max_transitions": 5
+  },
+  "fast_reversals_where_reference_constant": 31129
+}

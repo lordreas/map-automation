@@ -1,0 +1,53 @@
+{
+  "grid": [
+    4096,
+    2396
+  ],
+  "output": [
+    3840,
+    2160
+  ],
+  "results": {
+    "reference": [
+      {
+        "time": "2026-10-25T16:20:00+01:00",
+        "milliseconds": 2396.213
+      },
+      {
+        "time": "2026-10-25T16:20:20+01:00",
+        "milliseconds": 2400.352
+      },
+      {
+        "time": "2026-10-25T16:20:40+01:00",
+        "milliseconds": 2402.588
+      }
+    ],
+    "precise": [
+      {
+        "time": "2026-10-25T16:20:00+01:00",
+        "milliseconds": 1966.727,
+        "different_pixels": 0,
+        "max_byte_error": 0,
+        "traced_rays": 4683445
+      },
+      {
+        "time": "2026-10-25T16:20:20+01:00",
+        "milliseconds": 1966.747,
+        "different_pixels": 0,
+        "max_byte_error": 0,
+        "traced_rays": 4676563
+      },
+      {
+        "time": "2026-10-25T16:20:40+01:00",
+        "milliseconds": 1963.607,
+        "different_pixels": 0,
+        "max_byte_error": 0,
+        "traced_rays": 4662864
+      }
+    ]
+  },
+  "different_pixels": 0,
+  "budget_ms": 33.333333333333336,
+  "median_precise_ms": 1965.1770000000001,
+  "meets_30fps_offscreen": false
+}

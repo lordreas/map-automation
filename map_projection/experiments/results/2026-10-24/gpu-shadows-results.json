@@ -1,0 +1,95 @@
+{
+  "renderer": "PowerVR B-Series BXM-4-64",
+  "sun_hours": [
+    "09",
+    "12",
+    "16",
+    "18"
+  ],
+  "results": [
+    {
+      "grid": [
+        512,
+        300
+      ],
+      "output": [
+        3840,
+        2160
+      ],
+      "method": "max_pyramid",
+      "medians_ms": {
+        "gpu_shadow_and_lighting": 11.984,
+        "gpu_4k_gather": 8.714,
+        "total": 20.755
+      },
+      "p95_total_ms": 25.306,
+      "frames": 20,
+      "oracle_comparisons": 4096,
+      "oracle_mismatches": 0,
+      "iteration_cap_pixels": 0,
+      "cast_shadow_pixels": [
+        18818,
+        2463,
+        8376,
+        56304
+      ],
+      "max_gather_byte_difference": 0
+    },
+    {
+      "grid": [
+        1024,
+        599
+      ],
+      "output": [
+        3840,
+        2160
+      ],
+      "method": "max_pyramid",
+      "medians_ms": {
+        "gpu_shadow_and_lighting": 51.518,
+        "gpu_4k_gather": 9.227,
+        "total": 60.74
+      },
+      "p95_total_ms": 81.599,
+      "frames": 20,
+      "oracle_comparisons": 4096,
+      "oracle_mismatches": 0,
+      "iteration_cap_pixels": 0,
+      "cast_shadow_pixels": [
+        95025,
+        18322,
+        49939,
+        245995
+      ],
+      "max_gather_byte_difference": 0
+    },
+    {
+      "grid": [
+        2048,
+        1198
+      ],
+      "output": [
+        3840,
+        2160
+      ],
+      "method": "max_pyramid",
+      "medians_ms": {
+        "gpu_shadow_and_lighting": 222.641,
+        "gpu_4k_gather": 9.714,
+        "total": 232.517
+      },
+      "p95_total_ms": 319.682,
+      "frames": 20,
+      "oracle_comparisons": 4096,
+      "oracle_mismatches": 0,
+      "iteration_cap_pixels": 0,
+      "cast_shadow_pixels": [
+        417688,
+        91196,
+        228822,
+        1031042
+      ],
+      "max_gather_byte_difference": 0
+    }
+  ]
+}
