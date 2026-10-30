@@ -1,0 +1,5 @@
+/*.so
+/gpu-input.npz
+/*-results.json
+*.prof
+!results/**/*.png
