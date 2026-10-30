@@ -1,0 +1,35 @@
+[Unit]
+Description=4K terrain projection and LAN controls
+After=network.target systemd-user-sessions.service
+Conflicts=getty@tty1.service display-manager.service sddm.service
+
+[Service]
+Type=notify
+User=map
+SupplementaryGroups=video render input
+WorkingDirectory=/home/map/map-automation
+ExecStartPre=/usr/bin/test -c /dev/dri/card0
+ExecStartPre=+/bin/chvt 1
+ExecStart=/home/map/map-automation/.venv/bin/python -m map_projection --direct --width 3840 --height 2160 --refresh 60 --host 0.0.0.0 --port 8080
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=SDL_KMSDRM_DEVICE_INDEX=0
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+WatchdogSec=20
+TimeoutAbortSec=5
+TimeoutStartSec=90
+TimeoutStopSec=20
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+PAMName=login
+
+[Install]
+WantedBy=multi-user.target

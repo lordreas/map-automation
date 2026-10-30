@@ -1,0 +1,25 @@
+[Unit]
+Description=Terrain projector and local control interface
+After=network.target systemd-user-sessions.service
+Conflicts=getty@tty1.service
+
+[Service]
+# Change this user and checkout path to match the board. Grant the user video,
+# render and input device access; test --direct from a local VT before enabling.
+User=projection
+SupplementaryGroups=video render input
+WorkingDirectory=/opt/map-automation
+ExecStart=/usr/bin/python3 -m map_projection --direct --width 1920 --height 1080 --refresh 60 --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=PYTHONUNBUFFERED=1
+TTYPath=/dev/tty1
+StandardInput=tty
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+PAMName=login
+
+[Install]
+WantedBy=multi-user.target

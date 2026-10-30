@@ -1,0 +1,11 @@
+[Unit]
+Description=Prepare tomorrow's shadow cache at 23:30 installation time
+
+[Timer]
+OnCalendar=*-*-* 23:30:00 Europe/Zurich
+AccuracySec=1s
+Persistent=true
+Unit=map-projection-day-cache.service
+
+[Install]
+WantedBy=timers.target

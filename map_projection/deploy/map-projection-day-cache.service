@@ -1,0 +1,14 @@
+[Unit]
+Description=Prepare the next local day's precise shadow events
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=map
+WorkingDirectory=/home/map/map-automation
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+ExecStart=/home/map/map-automation/.venv/bin/python -m map_projection.day_cache --config /home/map/map-automation/map_projection/settings.json --horizons /home/map/map-automation/map_projection/.cache/horizons4096-compressed --events /home/map/map-automation/map_projection/.cache/events --next-day --max-bytes 10000000000
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min

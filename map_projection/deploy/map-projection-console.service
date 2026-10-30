@@ -1,0 +1,13 @@
+[Unit]
+Description=Ctrl+Alt toggle between projector and text console
+After=systemd-user-sessions.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/map-projection-console.py
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
