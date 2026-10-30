@@ -1,0 +1,11 @@
+.venv/
+.cache/
+__pycache__/
+*.dll
+*.so
+*.dylib
+*.lib
+*.pdb
+settings.json
+*.log
+*.pid

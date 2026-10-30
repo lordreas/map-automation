@@ -1,0 +1,8 @@
+numpy>=1.24,<3
+Pillow>=9.4
+tzdata>=2024.1; sys_platform == 'win32'
+PySDL2>=0.9.16
+PyOpenGL>=3.1.10; sys_platform == 'linux'
+pysdl2-dll>=2.28; sys_platform == 'win32'
+# Windows development only: pip install ziglang==0.14.1
+# On the Banana Pi use the distribution's gcc and python3 packages; see README.
